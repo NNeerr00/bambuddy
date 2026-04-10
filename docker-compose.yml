@@ -22,7 +22,7 @@ services:
     # Comment out "network_mode: host" above and uncomment "ports:" below.
     # Note: Printer discovery won't work - add printers manually by IP.
     #ports:
-    #  - "${PORT:-8000}:8000"
+    #  - "${PORT:-8000}:${PORT:-8000}"
     #  - "3000:3000"                  # Virtual printer bind/detect
     #  - "3002:3002"                  # Virtual printer bind/detect
     #  - "8883:8883"                  # Virtual printer MQTT
