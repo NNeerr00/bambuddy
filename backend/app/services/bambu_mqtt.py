@@ -389,6 +389,27 @@ class BambuMQTTClient:
     # force-close the socket before paho has time to reconnect.
     STALE_RECONNECT_COOLDOWN = 30.0
 
+    def _force_reconnect(self, reason: str) -> None:
+        """Force-close the socket so paho auto-reconnects.
+
+        Used by check_staleness() and start_print() zombie detection.
+        Does NOT call client.disconnect() — that's a clean disconnect and paho
+        would NOT auto-reconnect afterwards.
+        """
+        logger.warning("[%s] Forcing reconnect: %s", self.serial_number, reason)
+        self._last_stale_reconnect = time.time()
+        self.state.connected = False
+        if self.on_state_change:
+            self.on_state_change(self.state)
+        self._stale_reconnecting = True
+        if self._client:
+            try:
+                sock = self._client.socket()
+                if sock:
+                    sock.close()
+            except Exception:
+                pass  # Best-effort; paho loop will reconnect on next iteration
+
     def check_staleness(self) -> bool:
         """Check staleness and update connected state if stale. Returns True if connected."""
         if self.state.connected and self.is_stale():
@@ -398,40 +419,52 @@ class BambuMQTTClient:
             if now - self._last_stale_reconnect < self.STALE_RECONNECT_COOLDOWN:
                 return self.state.connected
 
-            logger.warning(
-                f"[{self.serial_number}] Connection stale - no message for {now - self._last_message_time:.1f}s, forcing reconnect"
+            self._force_reconnect(
+                f"no message for {now - self._last_message_time:.1f}s"
             )
-            self._last_stale_reconnect = now
-            self.state.connected = False
-            if self.on_state_change:
-                self.on_state_change(self.state)
-            # Force-close the underlying socket so paho's loop thread detects
-            # the broken connection and triggers auto-reconnect.  We don't call
-            # client.disconnect() because that's a clean disconnect and paho
-            # would NOT auto-reconnect afterwards.
-            # Set flag so _on_disconnect knows this was intentional and skips
-            # redundant state broadcast (we already set connected=False above).
-            self._stale_reconnecting = True
-            if self._client:
-                try:
-                    sock = self._client.socket()
-                    if sock:
-                        sock.close()
-                except Exception:
-                    pass  # Best-effort; paho loop will reconnect on next iteration
         return self.state.connected
 
     def _on_connect(self, client, userdata, flags, rc, properties=None):
         if rc == 0:
             self.state.connected = True
             self._stale_reconnecting = False  # Clear stale-reconnect flag on successful connect
-            # Reset per-connection warning state so warnings fire once per (re)connection
+
+            # ── Full state reset on (re)connect ──
+            # After extended uptime, stale tracking variables accumulate values
+            # from the previous session.  Reset everything so the new session
+            # starts clean.
+
+            # Print-job tracking
+            self._previous_gcode_state = None
+            self._previous_gcode_file = None
+            self._was_running = False
+            self._completion_triggered = False
+            self._timelapse_during_print = False
+            self._last_valid_progress = 0.0
+            self._last_valid_layer_num = 0
+
+            # AMS state
+            self._previous_ams_hash = None
+            self._ams_version_cache = {}
             self._ams_version_warned = set()
-            # Preserve cached developer_mode across auto-reconnects to avoid
-            # re-probing on every reconnect.  The probe (ams_filament_setting to
-            # ext slot) can destabilize some firmware MQTT brokers, causing a
-            # reconnect → probe → disconnect feedback loop (#887).  Only probe
-            # once when developer_mode is truly unknown (first connect).
+            self._captured_ams_mapping = None
+            self._last_load_tray_id = None
+
+            # Xcam hold timers
+            self._xcam_hold_start = {}
+
+            # Staleness tracking — mark connection as fresh
+            self._last_message_time = time.time()
+
+            # Request topic subscription
+            self._request_topic_confirmed = False
+
+            # Developer mode detection — preserve cached developer_mode across
+            # auto-reconnects to avoid re-probing on every reconnect.  The probe
+            # (ams_filament_setting to ext slot) can destabilize some firmware
+            # MQTT brokers, causing a reconnect → probe → disconnect feedback
+            # loop (#887).  Only probe once when developer_mode is truly unknown
+            # (first connect).
             # Reset probe tracking so stale timeout state doesn't carry over.
             self._dev_mode_probed = False
             self._dev_mode_needs_probe = False
@@ -2875,6 +2908,32 @@ class BambuMQTTClient:
             use_ams: Use AMS for automatic filament changes
         """
         if self._client and self.state.connected:
+            # ── Pre-flight zombie detection ──
+            # On P1S/P1P the MQTT broker can stop publishing while the TCP
+            # connection stays alive (zombie session).  paho thinks we're
+            # connected, but commands go into a black hole.  If we haven't
+            # received any message in >30s the session is likely dead — force
+            # reconnect and let the caller retry.
+            time_since_msg = time.time() - self._last_message_time if self._last_message_time else -1
+            logger.info(
+                "[%s] MQTT state before publish: connected=%s, client_connected=%s, "
+                "last_msg=%.1fs ago, gcode_state=%s",
+                self.serial_number,
+                self.state.connected,
+                self._client.is_connected() if self._client else False,
+                time_since_msg,
+                getattr(self.state, "gcode_state", None),
+            )
+            if self._last_message_time and time_since_msg > 30.0:
+                logger.warning(
+                    "[%s] Connection appears zombie (no message for %.1fs) — "
+                    "forcing reconnect before start_print",
+                    self.serial_number,
+                    time_since_msg,
+                )
+                self._force_reconnect("zombie detected before start_print")
+                return False
+
             # Bambu print command format - matches Bambu Studio's format
             # H2D series requires integer values (0/1) for calibration/leveling fields
             # but use_ams MUST remain boolean — H2D Pro firmware interprets integer
@@ -2978,8 +3037,12 @@ class BambuMQTTClient:
                 command["print"]["ams_mapping"] = flat_ams_mapping
                 command["print"]["ams_mapping2"] = ams_mapping2
 
-            logger.info("[%s] Sending print command: %s", self.serial_number, json.dumps(command))
-            self._client.publish(self.topic_publish, json.dumps(command), qos=1)
+            # NOTE: Do NOT use wait_for_publish() — Bambu brokers don't send PUBACK.
+            # The publish() call queues the message; we trust paho's TCP send.
+            command_json = json.dumps(command)
+            logger.info("[%s] Sending print command: %s", self.serial_number, command_json)
+            result = self._client.publish(self.topic_publish, command_json, qos=1)
+            logger.info("[%s] MQTT publish result: rc=%s, mid=%s", self.serial_number, result.rc, result.mid)
             return True
         else:
             # Log why we couldn't send the command

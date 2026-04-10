@@ -665,6 +665,30 @@ class BackgroundDispatchService:
                     use_ams=job.options.get("use_ams", True),
                 )
 
+                # Retry once after zombie reconnect — start_print() returns False
+                # when it detects a dead session and forces reconnect.  Give paho
+                # 10s to re-establish the TLS connection, then try again.
+                if not started:
+                    logger.warning(
+                        "Print command failed for %s — waiting 10s for reconnect and retrying once",
+                        printer_name,
+                    )
+                    await self._set_active_message(job, f"Reconnecting to {printer_name}, retrying...")
+                    await asyncio.sleep(10)
+                    self._raise_if_cancel_requested(job)
+                    started = printer_manager.start_print(
+                        job.printer_id,
+                        remote_filename,
+                        plate_id,
+                        ams_mapping=job.options.get("ams_mapping"),
+                        timelapse=job.options.get("timelapse", False),
+                        bed_levelling=job.options.get("bed_levelling", True),
+                        flow_cali=job.options.get("flow_cali", False),
+                        vibration_cali=job.options.get("vibration_cali", False),
+                        layer_inspect=job.options.get("layer_inspect", False),
+                        use_ams=job.options.get("use_ams", True),
+                    )
+
                 if not started:
                     await self._cleanup_sd_card_file(
                         printer_ip,
@@ -834,6 +858,28 @@ class BackgroundDispatchService:
                     layer_inspect=job.options.get("layer_inspect", False),
                     use_ams=job.options.get("use_ams", True),
                 )
+
+                # Retry once after zombie reconnect
+                if not started:
+                    logger.warning(
+                        "Print command failed for %s — waiting 10s for reconnect and retrying once",
+                        printer_name,
+                    )
+                    await self._set_active_message(job, f"Reconnecting to {printer_name}, retrying...")
+                    await asyncio.sleep(10)
+                    self._raise_if_cancel_requested(job)
+                    started = printer_manager.start_print(
+                        job.printer_id,
+                        remote_filename,
+                        plate_id,
+                        ams_mapping=job.options.get("ams_mapping"),
+                        timelapse=job.options.get("timelapse", False),
+                        bed_levelling=job.options.get("bed_levelling", True),
+                        flow_cali=job.options.get("flow_cali", False),
+                        vibration_cali=job.options.get("vibration_cali", False),
+                        layer_inspect=job.options.get("layer_inspect", False),
+                        use_ams=job.options.get("use_ams", True),
+                    )
 
                 if not started:
                     await self._cleanup_sd_card_file(

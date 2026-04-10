@@ -1842,6 +1842,26 @@ class PrintScheduler:
             use_ams=item.use_ams,
         )
 
+        # Retry once after zombie reconnect
+        if not started:
+            logger.warning(
+                "Queue item %s: Print command failed — waiting 10s for reconnect and retrying once",
+                item.id,
+            )
+            await asyncio.sleep(10)
+            started = printer_manager.start_print(
+                item.printer_id,
+                remote_filename,
+                plate_id=item.plate_id or 1,
+                ams_mapping=ams_mapping,
+                bed_levelling=item.bed_levelling,
+                flow_cali=item.flow_cali,
+                vibration_cali=item.vibration_cali,
+                layer_inspect=item.layer_inspect,
+                timelapse=item.timelapse,
+                use_ams=item.use_ams,
+            )
+
         if started:
             logger.info("Queue item %s: Print started successfully - %s", item.id, filename)
 
