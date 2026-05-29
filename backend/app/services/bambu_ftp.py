@@ -633,6 +633,18 @@ class BambuFTPClient:
             logger.warning("Failed to delete %s: %s", remote_path, e)
             return False
 
+    def rename_file(self, old_path: str, new_path: str) -> bool:
+        """Rename a file on the printer. Returns False when the source is missing."""
+        if not self._ftp:
+            return False
+
+        try:
+            self._ftp.rename(old_path, new_path)
+            return True
+        except (OSError, ftplib.Error) as e:
+            logger.warning("Failed to rename %s to %s: %s", old_path, new_path, e)
+            return False
+
     def get_file_size(self, remote_path: str) -> int | None:
         """Get the size of a file."""
         if not self._ftp:
@@ -1074,6 +1086,29 @@ async def delete_file_async(
         return False
 
     return await loop.run_in_executor(None, _delete)
+
+
+async def rename_file_async(
+    ip_address: str,
+    access_code: str,
+    old_path: str,
+    new_path: str,
+    socket_timeout: float | None = None,
+    printer_model: str | None = None,
+) -> bool:
+    """Async wrapper for renaming a file. Returns False when the source is missing."""
+    loop = asyncio.get_event_loop()
+
+    def _rename():
+        client = BambuFTPClient(ip_address, access_code, timeout=socket_timeout, printer_model=printer_model)
+        if client.connect():
+            try:
+                return client.rename_file(old_path, new_path)
+            finally:
+                client.disconnect()
+        return False
+
+    return await loop.run_in_executor(None, _rename)
 
 
 async def download_file_bytes_async(

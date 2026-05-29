@@ -28,6 +28,7 @@ from backend.app.services.bambu_ftp import (
     cache_3mf_download,
     delete_file_async,
     get_ftp_retry_settings,
+    rename_file_async,
     upload_file_async,
     with_ftp_retry,
 )
@@ -593,73 +594,102 @@ class BackgroundDispatchService:
             ftp_retry_enabled, ftp_retry_count, ftp_retry_delay, ftp_timeout = await get_ftp_retry_settings()
             self._raise_if_cancel_requested(job)
 
-            await self._set_active_message(job, f"Preparing upload to {printer_name}...")
-            await delete_file_async(
-                printer_ip,
-                printer_access_code,
-                remote_path,
-                socket_timeout=ftp_timeout,
-                printer_model=printer_model,
-            )
+            # Cache-hit pre-flight: prior prints leave the file as `{path}.cached`
+            # (renamed post-FINISH to defeat the auto-restart firmware bug). If the
+            # rename back to `{path}` succeeds, we can skip the FTP upload entirely.
+            cached_remote_path = f"{remote_path}.cached"
+            cache_hit = False
+            try:
+                await self._set_active_message(job, f"Checking print cache on {printer_name}...")
+                cache_hit = await rename_file_async(
+                    printer_ip,
+                    printer_access_code,
+                    cached_remote_path,
+                    remote_path,
+                    socket_timeout=ftp_timeout,
+                    printer_model=printer_model,
+                )
+            except Exception as e:
+                logger.warning("Cache lookup failed for %s: %s", cached_remote_path, e)
+                cache_hit = False
 
             self._raise_if_cancel_requested(job)
 
+            if not cache_hit:
+                await self._set_active_message(job, f"Preparing upload to {printer_name}...")
+                await delete_file_async(
+                    printer_ip,
+                    printer_access_code,
+                    remote_path,
+                    socket_timeout=ftp_timeout,
+                    printer_model=printer_model,
+                )
+
+                self._raise_if_cancel_requested(job)
+
             try:
-                await self._set_active_message(job, f"Uploading {archive_filename} to {printer_name}...")
-                loop = asyncio.get_running_loop()
-                progress_state = {"last_emit": 0.0, "last_bytes": 0}
+                if cache_hit:
+                    logger.info("FTP cache hit for %s on %s — skipping upload", remote_path, printer_name)
+                    await self._set_active_message(job, f"Cache hit! Skipping upload to {printer_name}...")
+                    await self._set_active_upload_progress(job, 1, 1)
+                else:
+                    await self._set_active_message(job, f"Uploading {archive_filename} to {printer_name}...")
+                    loop = asyncio.get_running_loop()
+                    progress_state = {"last_emit": 0.0, "last_bytes": 0}
 
-                def upload_progress_callback(uploaded: int, total: int):
-                    if self._is_cancel_requested(job.id):
-                        raise DispatchJobCancelled(f"Dispatch job {job.id} cancelled during upload")
+                    def upload_progress_callback(uploaded: int, total: int):
+                        if self._is_cancel_requested(job.id):
+                            raise DispatchJobCancelled(f"Dispatch job {job.id} cancelled during upload")
 
-                    now = time.monotonic()
-                    should_emit = (
-                        uploaded >= total
-                        or now - progress_state["last_emit"] >= 0.2
-                        or uploaded - progress_state["last_bytes"] >= 256 * 1024
-                    )
-
-                    if should_emit:
-                        progress_state["last_emit"] = now
-                        progress_state["last_bytes"] = uploaded
-                        loop.call_soon_threadsafe(
-                            lambda u=uploaded, t=total: asyncio.create_task(self._set_active_upload_progress(job, u, t))
+                        now = time.monotonic()
+                        should_emit = (
+                            uploaded >= total
+                            or now - progress_state["last_emit"] >= 0.2
+                            or uploaded - progress_state["last_bytes"] >= 256 * 1024
                         )
 
-                if ftp_retry_enabled:
-                    uploaded = await with_ftp_retry(
-                        upload_file_async,
-                        printer_ip,
-                        printer_access_code,
-                        file_path,
-                        remote_path,
-                        progress_callback=upload_progress_callback,
-                        socket_timeout=ftp_timeout,
-                        printer_model=printer_model,
-                        max_retries=ftp_retry_count,
-                        retry_delay=ftp_retry_delay,
-                        operation_name=f"Upload for reprint to {printer_name}",
-                        non_retry_exceptions=(DispatchJobCancelled,),
-                    )
-                else:
-                    uploaded = await upload_file_async(
-                        printer_ip,
-                        printer_access_code,
-                        file_path,
-                        remote_path,
-                        progress_callback=upload_progress_callback,
-                        socket_timeout=ftp_timeout,
-                        printer_model=printer_model,
-                    )
+                        if should_emit:
+                            progress_state["last_emit"] = now
+                            progress_state["last_bytes"] = uploaded
+                            loop.call_soon_threadsafe(
+                                lambda u=uploaded, t=total: asyncio.create_task(
+                                    self._set_active_upload_progress(job, u, t)
+                                )
+                            )
 
-                if uploaded:
-                    await self._set_active_upload_progress(job, 1, 1)
+                    if ftp_retry_enabled:
+                        uploaded = await with_ftp_retry(
+                            upload_file_async,
+                            printer_ip,
+                            printer_access_code,
+                            file_path,
+                            remote_path,
+                            progress_callback=upload_progress_callback,
+                            socket_timeout=ftp_timeout,
+                            printer_model=printer_model,
+                            max_retries=ftp_retry_count,
+                            retry_delay=ftp_retry_delay,
+                            operation_name=f"Upload for reprint to {printer_name}",
+                            non_retry_exceptions=(DispatchJobCancelled,),
+                        )
+                    else:
+                        uploaded = await upload_file_async(
+                            printer_ip,
+                            printer_access_code,
+                            file_path,
+                            remote_path,
+                            progress_callback=upload_progress_callback,
+                            socket_timeout=ftp_timeout,
+                            printer_model=printer_model,
+                        )
 
-                if not uploaded:
-                    raise RuntimeError(
-                        "Failed to upload file to printer. Check if SD card is inserted and properly formatted (FAT32/exFAT)."
-                    )
+                    if uploaded:
+                        await self._set_active_upload_progress(job, 1, 1)
+
+                    if not uploaded:
+                        raise RuntimeError(
+                            "Failed to upload file to printer. Check if SD card is inserted and properly formatted (FAT32/exFAT)."
+                        )
 
                 register_expected_print(
                     job.printer_id,
@@ -797,74 +827,103 @@ class BackgroundDispatchService:
             ftp_retry_enabled, ftp_retry_count, ftp_retry_delay, ftp_timeout = await get_ftp_retry_settings()
             self._raise_if_cancel_requested(job)
 
-            await self._set_active_message(job, f"Preparing upload to {printer_name}...")
-            await delete_file_async(
-                printer_ip,
-                printer_access_code,
-                remote_path,
-                socket_timeout=ftp_timeout,
-                printer_model=printer_model,
-            )
+            # Cache-hit pre-flight: prior prints leave the file as `{path}.cached`
+            # (renamed post-FINISH to defeat the auto-restart firmware bug). If the
+            # rename back to `{path}` succeeds, we can skip the FTP upload entirely.
+            cached_remote_path = f"{remote_path}.cached"
+            cache_hit = False
+            try:
+                await self._set_active_message(job, f"Checking print cache on {printer_name}...")
+                cache_hit = await rename_file_async(
+                    printer_ip,
+                    printer_access_code,
+                    cached_remote_path,
+                    remote_path,
+                    socket_timeout=ftp_timeout,
+                    printer_model=printer_model,
+                )
+            except Exception as e:
+                logger.warning("Cache lookup failed for %s: %s", cached_remote_path, e)
+                cache_hit = False
 
             self._raise_if_cancel_requested(job)
 
+            if not cache_hit:
+                await self._set_active_message(job, f"Preparing upload to {printer_name}...")
+                await delete_file_async(
+                    printer_ip,
+                    printer_access_code,
+                    remote_path,
+                    socket_timeout=ftp_timeout,
+                    printer_model=printer_model,
+                )
+
+                self._raise_if_cancel_requested(job)
+
             try:
-                await self._set_active_message(job, f"Uploading {library_filename} to {printer_name}...")
-                loop = asyncio.get_running_loop()
-                progress_state = {"last_emit": 0.0, "last_bytes": 0}
+                if cache_hit:
+                    logger.info("FTP cache hit for %s on %s — skipping upload", remote_path, printer_name)
+                    await self._set_active_message(job, f"Cache hit! Skipping upload to {printer_name}...")
+                    await self._set_active_upload_progress(job, 1, 1)
+                else:
+                    await self._set_active_message(job, f"Uploading {library_filename} to {printer_name}...")
+                    loop = asyncio.get_running_loop()
+                    progress_state = {"last_emit": 0.0, "last_bytes": 0}
 
-                def upload_progress_callback(uploaded: int, total: int):
-                    if self._is_cancel_requested(job.id):
-                        raise DispatchJobCancelled(f"Dispatch job {job.id} cancelled during upload")
+                    def upload_progress_callback(uploaded: int, total: int):
+                        if self._is_cancel_requested(job.id):
+                            raise DispatchJobCancelled(f"Dispatch job {job.id} cancelled during upload")
 
-                    now = time.monotonic()
-                    should_emit = (
-                        uploaded >= total
-                        or now - progress_state["last_emit"] >= 0.2
-                        or uploaded - progress_state["last_bytes"] >= 256 * 1024
-                    )
-
-                    if should_emit:
-                        progress_state["last_emit"] = now
-                        progress_state["last_bytes"] = uploaded
-                        loop.call_soon_threadsafe(
-                            lambda u=uploaded, t=total: asyncio.create_task(self._set_active_upload_progress(job, u, t))
+                        now = time.monotonic()
+                        should_emit = (
+                            uploaded >= total
+                            or now - progress_state["last_emit"] >= 0.2
+                            or uploaded - progress_state["last_bytes"] >= 256 * 1024
                         )
 
-                if ftp_retry_enabled:
-                    uploaded = await with_ftp_retry(
-                        upload_file_async,
-                        printer_ip,
-                        printer_access_code,
-                        file_path,
-                        remote_path,
-                        progress_callback=upload_progress_callback,
-                        socket_timeout=ftp_timeout,
-                        printer_model=printer_model,
-                        max_retries=ftp_retry_count,
-                        retry_delay=ftp_retry_delay,
-                        operation_name=f"Upload for print to {printer_name}",
-                        non_retry_exceptions=(DispatchJobCancelled,),
-                    )
-                else:
-                    uploaded = await upload_file_async(
-                        printer_ip,
-                        printer_access_code,
-                        file_path,
-                        remote_path,
-                        progress_callback=upload_progress_callback,
-                        socket_timeout=ftp_timeout,
-                        printer_model=printer_model,
-                    )
+                        if should_emit:
+                            progress_state["last_emit"] = now
+                            progress_state["last_bytes"] = uploaded
+                            loop.call_soon_threadsafe(
+                                lambda u=uploaded, t=total: asyncio.create_task(
+                                    self._set_active_upload_progress(job, u, t)
+                                )
+                            )
 
-                if uploaded:
-                    await self._set_active_upload_progress(job, 1, 1)
+                    if ftp_retry_enabled:
+                        uploaded = await with_ftp_retry(
+                            upload_file_async,
+                            printer_ip,
+                            printer_access_code,
+                            file_path,
+                            remote_path,
+                            progress_callback=upload_progress_callback,
+                            socket_timeout=ftp_timeout,
+                            printer_model=printer_model,
+                            max_retries=ftp_retry_count,
+                            retry_delay=ftp_retry_delay,
+                            operation_name=f"Upload for print to {printer_name}",
+                            non_retry_exceptions=(DispatchJobCancelled,),
+                        )
+                    else:
+                        uploaded = await upload_file_async(
+                            printer_ip,
+                            printer_access_code,
+                            file_path,
+                            remote_path,
+                            progress_callback=upload_progress_callback,
+                            socket_timeout=ftp_timeout,
+                            printer_model=printer_model,
+                        )
 
-                if not uploaded:
-                    await db.rollback()
-                    raise RuntimeError(
-                        "Failed to upload file to printer. Check if SD card is inserted and properly formatted (FAT32/exFAT)."
-                    )
+                    if uploaded:
+                        await self._set_active_upload_progress(job, 1, 1)
+
+                    if not uploaded:
+                        await db.rollback()
+                        raise RuntimeError(
+                            "Failed to upload file to printer. Check if SD card is inserted and properly formatted (FAT32/exFAT)."
+                        )
 
                 register_expected_print(
                     job.printer_id,
