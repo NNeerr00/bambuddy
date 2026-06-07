@@ -5086,6 +5086,7 @@ export default {
 
   // Configure AMS Slot Modal
   configureAmsSlot: {
+    quickSelect: 'Seleção rápida',
     title: 'Configurar Slot AMS',
     slotConfigured: 'Slot Configurado!',
     configuringSlot: 'Configurando slot:',

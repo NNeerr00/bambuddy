@@ -5085,6 +5085,7 @@ export default {
 
   // Configure AMS Slot Modal
   configureAmsSlot: {
+    quickSelect: '快速选择',
     title: '配置 AMS 槽位',
     slotConfigured: '槽位已配置！',
     configuringSlot: '正在配置槽位：',

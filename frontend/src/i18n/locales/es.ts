@@ -5106,6 +5106,7 @@ export default {
 
   // Configure AMS Slot Modal
   configureAmsSlot: {
+    quickSelect: 'Selección rápida',
     title: 'Configurar la ranura del AMS',
     slotConfigured: '¡Ranura configurada!',
     configuringSlot: 'Configurando la ranura:',

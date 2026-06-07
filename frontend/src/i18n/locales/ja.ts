@@ -5098,6 +5098,7 @@ export default {
 
   // Configure AMS Slot Modal
   configureAmsSlot: {
+    quickSelect: 'クイック選択',
     title: 'AMSスロットの設定',
     slotConfigured: 'スロットを設定しました！',
     configuringSlot: 'スロットを設定中：',
