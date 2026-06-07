@@ -181,6 +181,17 @@ const COLOR_NAME_MAP: Record<string, string> = {
   'wood': 'DEB887',
 };
 
+// Quick Select filaments — the handful of presets a farm operator changes to 99% of
+// the time. Each maps to a generic built-in filament_id (== tray_info_idx) so clicking a
+// chip drives the exact same submission path as picking it from the dropdown below.
+const QUICK_SELECT_FILAMENTS = [
+  { filamentId: 'GFL99', material: 'PLA', colorName: 'Black', colorHex: '000000' },
+  { filamentId: 'GFL99', material: 'PLA', colorName: 'White', colorHex: 'FFFFFF' },
+  { filamentId: 'GFG99', material: 'PETG', colorName: 'Black', colorHex: '000000' },
+  { filamentId: 'GFG99', material: 'PETG', colorName: 'White', colorHex: 'FFFFFF' },
+  { filamentId: 'GFU99', material: 'TPU', colorName: 'Black', colorHex: '000000' },
+] as const;
+
 // Quick-select color presets (common filament colors)
 // Basic colors shown by default
 const QUICK_COLORS_BASIC = [
@@ -809,11 +820,69 @@ export function ConfigureAmsSlotModal({
     }
   }, [selectedPresetId, isLoading]);
 
+  // Resolve a generic filament_id to the preset id actually present in the loaded data,
+  // so a Quick Select chip selects the same entry a manual dropdown click would. Prefer a
+  // cloud preset mapping to this filament_id (built-ins get covered by cloud when present),
+  // otherwise fall back to the built-in entry id.
+  const resolveQuickSelectId = useCallback((filamentId: string): string => {
+    const cloud = cloudSettings?.filament?.find(
+      p => p.setting_id === filamentId || convertToTrayInfoIdx(p.setting_id) === filamentId
+    );
+    return cloud ? cloud.setting_id : `builtin_${filamentId}`;
+  }, [cloudSettings?.filament]);
+
+  // The generic filament_id the current selection resolves to (for chip highlighting).
+  const selectedFilamentId = useMemo(() => {
+    if (!selectedPresetId) return null;
+    if (selectedPresetId.startsWith('builtin_')) return selectedPresetId.slice('builtin_'.length);
+    if (selectedPresetId.startsWith('local_')) return null;
+    return convertToTrayInfoIdx(selectedPresetId);
+  }, [selectedPresetId]);
+
+  const handleQuickSelect = useCallback((f: typeof QUICK_SELECT_FILAMENTS[number]) => {
+    setSelectedPresetId(resolveQuickSelectId(f.filamentId));
+    setColorHex(f.colorHex);
+    setColorInput(f.colorName);
+  }, [resolveQuickSelectId]);
+
   if (!isOpen) return null;
   const canSave = selectedPresetId && !configureMutation.isPending;
 
   // Get display color (custom or slot default)
   const displayColor = colorHex || slotInfo.trayColor?.slice(0, 6) || 'FFFFFF';
+
+  // Compact "Quick Select" chip row rendered above the filament dropdown in both layouts.
+  const quickSelectRow = (
+    <div className="mb-3">
+      <label className="block text-sm text-bambu-gray mb-1.5">
+        {t('configureAmsSlot.quickSelect')}
+      </label>
+      <div className="flex flex-wrap gap-1.5">
+        {QUICK_SELECT_FILAMENTS.map((f) => {
+          const isActive = selectedFilamentId === f.filamentId && colorHex === f.colorHex;
+          return (
+            <button
+              key={`${f.filamentId}-${f.colorHex}`}
+              type="button"
+              onClick={() => handleQuickSelect(f)}
+              className={`h-7 px-2 rounded-md border-2 transition-all flex items-center gap-1.5 ${
+                isActive
+                  ? 'border-bambu-green bg-bambu-green/20'
+                  : 'border-bambu-dark-tertiary hover:border-bambu-gray'
+              }`}
+              title={`${f.material} — ${f.colorName}`}
+            >
+              <span
+                className="w-3 h-3 rounded-full border border-black/20 flex-shrink-0"
+                style={{ backgroundColor: `#${f.colorHex}` }}
+              />
+              <span className="text-xs text-white/80 whitespace-nowrap">{f.material}</span>
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
 
   return (
     <div className={`fixed inset-0 z-50 flex ${fullScreen ? '' : 'items-center justify-center'}`}>
@@ -905,6 +974,7 @@ export function ConfigureAmsSlotModal({
             <div className="flex gap-4 h-full">
               {/* Left column: Filament preset list (takes full height) */}
               <div className="w-1/2 flex flex-col min-h-0">
+                {quickSelectRow}
                 <label className="block text-sm text-bambu-gray mb-2">
                   {t('configureAmsSlot.filamentProfile')} <span className="text-red-400">*</span>
                 </label>
@@ -1137,6 +1207,9 @@ export function ConfigureAmsSlotModal({
             </div>
           ) : (
             <>
+              {/* Quick Select chips */}
+              {quickSelectRow}
+
               {/* Filament Profile Select */}
               <div>
                 <label className="block text-sm text-bambu-gray mb-2">

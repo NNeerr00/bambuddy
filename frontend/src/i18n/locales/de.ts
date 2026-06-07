@@ -5097,6 +5097,7 @@ export default {
 
   // Configure AMS Slot Modal
   configureAmsSlot: {
+    quickSelect: 'Schnellauswahl',
     title: 'AMS-Slot konfigurieren',
     slotConfigured: 'Slot konfiguriert!',
     configuringSlot: 'Slot wird konfiguriert:',

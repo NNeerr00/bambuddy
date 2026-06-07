@@ -185,6 +185,78 @@ describe('ConfigureAmsSlotModal', () => {
     expect(colorInput).toHaveValue('Red');
   });
 
+  it('renders the Quick Select filament chips', async () => {
+    render(<ConfigureAmsSlotModal {...defaultProps} />);
+    await waitFor(() => {
+      expect(screen.getByTitle('PLA — Black')).toBeInTheDocument();
+    });
+    expect(screen.getByTitle('PLA — White')).toBeInTheDocument();
+    expect(screen.getByTitle('PETG — Black')).toBeInTheDocument();
+    expect(screen.getByTitle('PETG — White')).toBeInTheDocument();
+    expect(screen.getByTitle('TPU — Black')).toBeInTheDocument();
+  });
+
+  it('Quick Select chip submits the matching generic filament via the built-in path', async () => {
+    // The generics resolve to built-in presets when no cloud preset maps to them.
+    (api.getBuiltinFilaments as ReturnType<typeof vi.fn>).mockResolvedValue([
+      { filament_id: 'GFL99', name: 'Generic PLA' },
+      { filament_id: 'GFG99', name: 'Generic PETG' },
+      { filament_id: 'GFU99', name: 'Generic TPU' },
+    ]);
+
+    render(<ConfigureAmsSlotModal {...defaultProps} />);
+
+    await waitFor(() => {
+      expect(screen.getByTitle('PETG — Black')).toBeInTheDocument();
+    });
+
+    // Clicking the chip selects material + color exactly like a dropdown + color click
+    fireEvent.click(screen.getByTitle('PETG — Black'));
+
+    const colorInput = screen.getByPlaceholderText(/Color name or hex/);
+    expect(colorInput).toHaveValue('Black');
+
+    fireEvent.click(screen.getByRole('button', { name: /Configure Slot/i }));
+
+    await waitFor(() => {
+      expect(api.configureAmsSlot).toHaveBeenCalled();
+    });
+
+    const payload = (api.configureAmsSlot as ReturnType<typeof vi.fn>).mock.calls[0][3];
+    expect(payload.tray_info_idx).toBe('GFG99');
+    expect(payload.tray_type).toBe('PETG');
+    expect(payload.tray_color).toBe('000000FF');
+  });
+
+  it('Quick Select chip prefers a matching cloud preset when one exists', async () => {
+    // Cloud account already carries Generic PLA → the chip must select that cloud
+    // preset's setting_id, not the built-in fallback, mirroring a manual dropdown pick.
+    (api.getCloudSettings as ReturnType<typeof vi.fn>).mockResolvedValue({
+      filament: [
+        { setting_id: 'GFSL99', name: 'Generic PLA @BBL X1C', filament_id: 'GFL99' },
+      ],
+    });
+
+    render(<ConfigureAmsSlotModal {...defaultProps} />);
+
+    await waitFor(() => {
+      expect(screen.getByTitle('PLA — White')).toBeInTheDocument();
+    });
+
+    fireEvent.click(screen.getByTitle('PLA — White'));
+    fireEvent.click(screen.getByRole('button', { name: /Configure Slot/i }));
+
+    await waitFor(() => {
+      expect(api.configureAmsSlot).toHaveBeenCalled();
+    });
+
+    const payload = (api.configureAmsSlot as ReturnType<typeof vi.fn>).mock.calls[0][3];
+    // GFSL99 → GFL99 via convertToTrayInfoIdx, submitted as a cloud preset
+    expect(payload.tray_info_idx).toBe('GFL99');
+    expect(payload.setting_id).toBe('GFSL99');
+    expect(payload.tray_color).toBe('FFFFFFFF');
+  });
+
   it('sends PFUS setting_id as tray_info_idx when cloud detail has filament_id: null (#1053)', async () => {
     // Cloud returns a user preset that inherits from a generic Bambu base and
     // has no distinct filament_id of its own — this is how Bambu Cloud responds
