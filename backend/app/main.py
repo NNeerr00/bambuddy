@@ -3246,9 +3246,11 @@ async def on_print_complete(printer_id: int, data: dict):
                 if archive:
                     archive_id = archive.id
 
-    # Cleanup: delete uploaded file from printer SD card to prevent phantom prints (Issue #374)
-    # The print scheduler uploads files to the SD card root (/). Some printers (e.g. P1S)
-    # auto-start files found in root on power cycle, causing ghost prints.
+    # Cleanup: rename uploaded file to `{path}.cached` to prevent phantom prints (Issue #374)
+    # while preserving the file on the SD card for the next dispatch to reuse.
+    # The auto-start firmware bug keys off the exact filepath of the last print, so renaming
+    # defeats it just as well as deleting — and the cached copy lets the next dispatch of the
+    # same filename skip the FTP upload entirely (BackgroundDispatchService cache-hit path).
     # Must run before the archive_id early-return so it executes even when archiving is disabled.
     try:
         if subtask_name:
@@ -3259,40 +3261,48 @@ async def on_print_complete(printer_id: int, data: dict):
                 printer = result.scalar_one_or_none()
 
             if printer:
-                from backend.app.services.bambu_ftp import delete_file_async
+                from backend.app.services.bambu_ftp import rename_file_async
 
                 # Try both .3mf and .gcode extensions — the printer may have either
                 for ext in (".3mf", ".gcode"):
                     remote_path = f"/{subtask_name}{ext}"
+                    cached_path = f"{remote_path}.cached"
                     # Retry up to 3 times — the printer may still lock the filesystem briefly after a print ends
                     for attempt in range(1, 4):
                         try:
-                            delete_result = await delete_file_async(
+                            rename_result = await rename_file_async(
                                 printer.ip_address,
                                 printer.access_code,
                                 remote_path,
+                                cached_path,
                                 printer_model=printer.model,
                             )
-                            if delete_result:
-                                logger.info("Deleted %s from printer %s SD card", remote_path, printer.name)
+                            if rename_result:
+                                logger.info(
+                                    "Cached %s as %s on printer %s SD card",
+                                    remote_path,
+                                    cached_path,
+                                    printer.name,
+                                )
                                 break
                         except Exception as e:
-                            delete_result = False
+                            rename_result = False
                             logger.warning(
-                                "SD card cleanup attempt %d/3 raised for %s: %s",
+                                "SD card cache rename attempt %d/3 raised for %s: %s",
                                 attempt,
                                 remote_path,
                                 e,
                             )
-                        if not delete_result and attempt < 3:
+                        if not rename_result and attempt < 3:
                             await asyncio.sleep(2)
-                        elif not delete_result:
+                        elif not rename_result:
                             logger.warning(
-                                "SD card cleanup failed after 3 attempts for %s (file may linger on SD card)",
+                                "SD card cache rename failed after 3 attempts for %s "
+                                "(file may linger and re-trigger auto-start on power cycle)",
                                 remote_path,
                             )
     except Exception as e:
-        logger.warning("SD card file cleanup failed for printer %s: %s", printer_id, e)
+        logger.warning("SD card cache rename failed for printer %s: %s", printer_id, e)
 
     log_timing("SD card cleanup")
 
