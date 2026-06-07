@@ -4,8 +4,11 @@ Bambu Lab Cloud API Routes
 Handles authentication and profile management with Bambu Cloud.
 """
 
+import hashlib
 import json
 import logging
+import os
+import time
 from pathlib import Path
 from typing import Literal
 
@@ -441,7 +444,36 @@ async def logout(
 ):
     """Log out of Bambu Cloud."""
     await clear_token(db, current_user)
+    _invalidate_slicer_settings_cache()
     return {"success": True}
+
+
+# In-memory TTL cache for the parsed /cloud/settings response.
+#
+# Bambu Cloud is queried live on every call (see BambuCloudService.get_slicer_settings),
+# which is the slow "loading all the filaments" spinner in the Configure AMS Slot dialog.
+# Presets change rarely, so cache the parsed response per-account for a short window.
+# Keyed by (token-hash, version) so different accounts/versions never collide and a
+# re-login (new token) naturally bypasses stale entries. Invalidated on any preset
+# create/update/delete and on logout. Override the TTL with CLOUD_SETTINGS_CACHE_TTL
+# (seconds); set it to 0 to disable caching entirely.
+_SLICER_SETTINGS_TTL = float(os.getenv("CLOUD_SETTINGS_CACHE_TTL", "600"))
+_slicer_settings_cache: dict[str, tuple[float, "SlicerSettingsResponse"]] = {}
+
+
+def _slicer_cache_key(token: str, version: str) -> str:
+    """Stable cache key that never stores the raw token."""
+    return f"{hashlib.sha256(token.encode()).hexdigest()}:{version}"
+
+
+def _invalidate_slicer_settings_cache() -> None:
+    """Drop all cached slicer-settings responses.
+
+    Called after any preset mutation or logout. Clearing the whole map (rather than a
+    single account's entries) keeps invalidation simple and correct; the cache is cheap
+    to rebuild and mutations are infrequent.
+    """
+    _slicer_settings_cache.clear()
 
 
 @router.get("/settings", response_model=SlicerSettingsResponse)
@@ -453,11 +485,23 @@ async def get_slicer_settings(
     """
     Get all slicer settings (filament, printer, process presets).
 
-    Requires authentication.
+    Requires authentication. The parsed response is served from a short-lived
+    per-account cache (see _SLICER_SETTINGS_TTL) to avoid hitting Bambu Cloud on
+    every open of the filament dialog.
     """
     cloud = await build_authenticated_cloud(db, current_user)
     if cloud is None or not cloud.is_authenticated:
         raise HTTPException(status_code=401, detail="Not authenticated")
+
+    # Serve from cache when warm. Building the (network-free) cloud client above keeps
+    # the original auth semantics — an expired/missing token still 401s before any hit.
+    token, _email, _region = await get_stored_token(db, current_user)
+    cache_key = _slicer_cache_key(token, version) if token and _SLICER_SETTINGS_TTL > 0 else None
+    if cache_key is not None:
+        cached = _slicer_settings_cache.get(cache_key)
+        if cached is not None and cached[0] > time.monotonic():
+            await cloud.close()
+            return cached[1]
 
     try:
         data = await cloud.get_slicer_settings(version)
@@ -505,9 +549,12 @@ async def get_slicer_settings(
                 )
             setattr(result, our_type, parsed)
 
+        if cache_key is not None:
+            _slicer_settings_cache[cache_key] = (time.monotonic() + _SLICER_SETTINGS_TTL, result)
         return result
     except BambuCloudAuthError:
         await clear_token(db, current_user)
+        _invalidate_slicer_settings_cache()
         raise HTTPException(status_code=401, detail="Authentication expired")
     except BambuCloudError as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -955,6 +1002,7 @@ async def create_setting(
             setting=request.setting,
             version=request.version,
         )
+        _invalidate_slicer_settings_cache()
         return data
     except BambuCloudAuthError:
         await clear_token(db, current_user)
@@ -987,6 +1035,7 @@ async def update_setting(
             name=request.name,
             setting=request.setting,
         )
+        _invalidate_slicer_settings_cache()
         return data
     except BambuCloudAuthError:
         await clear_token(db, current_user)
@@ -1014,6 +1063,7 @@ async def delete_setting(
 
     try:
         result = await cloud.delete_setting(setting_id)
+        _invalidate_slicer_settings_cache()
         return SlicerSettingDeleteResponse(
             success=result.get("success", True),
             message=result.get("message", "Setting deleted"),
