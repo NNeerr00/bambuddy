@@ -22,6 +22,9 @@ from backend.app.models.spoolman_k_profile import SpoolmanKProfile
 from backend.app.models.spoolman_slot_assignment import SpoolmanSlotAssignment
 from backend.app.models.user import User
 from backend.app.services.printer_manager import printer_manager
+from backend.app.services.slicer_filament_resolver import resolve_slicer_filament
+from backend.app.services.slot_nozzle import resolve_slot_nozzle
+from backend.app.services.spool_filament_preset import resolve_spoolman_preset
 from backend.app.services.spoolman import (
     SpoolmanClientError,
     SpoolmanNotFoundError,
@@ -32,9 +35,10 @@ from backend.app.services.spoolman import (
 )
 from backend.app.utils.filament_ids import (
     GENERIC_FILAMENT_IDS,
-    MATERIAL_TEMPS,
+    filament_id_to_setting_id,
     normalize_slicer_filament,
 )
+from backend.app.utils.filament_types import nozzle_temp_range, printer_filament_type
 
 logger = logging.getLogger(__name__)
 
@@ -100,14 +104,47 @@ async def get_spoolman_status(
     db: AsyncSession = Depends(get_db),
     _: User | None = RequirePermissionIfAuthEnabled(Permission.FILAMENTS_READ),
 ):
-    """Get Spoolman integration status."""
+    """Get Spoolman integration status.
+
+    ``connected`` answers "does the configured Spoolman respond?", which means
+    asking it. It used to answer "has some earlier request in this process left
+    a client object lying around?" -- and roughly twenty call sites build one
+    lazily, so the answer depended on which page happened to load first rather
+    than on anything about Spoolman.
+
+    That mattered because the UI reads this one flag twice: it offers Connect
+    only while disconnected, and the AMS sync section only while connected.
+    Saving the Settings page initialises a client as a side effect of syncing
+    locations, so enabling Spoolman there reported "connected" without anything
+    having been set up, hiding the Connect button and revealing a sync that then
+    failed on every slot (issue #2903). Registration no longer depends on that
+    button, but the flag was still describing Bambuddy's memory rather than the
+    integration, so it is now resolved the same way every other route resolves
+    it -- including the stale-URL check, so editing the URL is not reported
+    against the old host.
+    """
     sm = await get_spoolman_settings(db)
     enabled, url = sm["enabled"], sm["url"]
 
-    client = await get_spoolman_client()
     connected = False
-    if client:
-        connected = await client.health_check()
+    if enabled and url:
+        client = await get_spoolman_client()
+        if not client or client.base_url != url.rstrip("/"):
+            try:
+                client = await init_spoolman_client(url)
+            except ValueError as exc:
+                logger.warning("Spoolman URL %r rejected by SSRF guard during status check: %s", url, exc)
+                client = None
+            except Exception as exc:
+                # Every remaining way this can fail still answers the question:
+                # replacing a client closes the previous one, and httpx's
+                # aclose() is not guaranteed not to raise. A status poll that
+                # 500s every 30 seconds is worse than one reporting what is
+                # true either way -- that Spoolman could not be reached.
+                logger.warning("Could not open a Spoolman client for %r during status check: %s", url, exc)
+                client = None
+        if client:
+            connected = await client.health_check()
 
     return SpoolmanStatus(
         enabled=enabled,
@@ -222,6 +259,11 @@ async def sync_printer_ams(
     skipped: list[SkippedSpool] = []
     errors = []
 
+    from backend.app.api.routes.settings import get_setting
+
+    _auto_add_raw = await get_setting(db, "auto_add_unknown_rfid")
+    auto_add_unknown_rfid = _auto_add_raw is None or _auto_add_raw.lower() == "true"
+
     # Handle different AMS data structures
     # Traditional AMS: list of {"id": N, "tray": [...]} dicts
     # H2D/newer printers: dict with different structure
@@ -326,6 +368,7 @@ async def sync_printer_ams(
                     cached_spools=cached_spools,
                     inventory_remaining=inv_remaining,
                     spoolman_spool_id_hint=hint,
+                    auto_add_unknown_rfid=auto_add_unknown_rfid,
                 )
                 if sync_result:
                     synced += 1
@@ -337,6 +380,15 @@ async def sync_printer_ams(
                             logger.debug("Added newly created spool %s to cache", sync_result["id"])
                     logger.info(
                         "Synced %s from %s AMS %s tray %s", tray.tray_sub_brands, printer.name, ams_id, tray.tray_id
+                    )
+                elif spool_tag and not auto_add_unknown_rfid:
+                    skipped.append(
+                        SkippedSpool(
+                            location=f"AMS {ams_id} T{tray.tray_id}",
+                            reason="Auto-add disabled; add to inventory manually",
+                            filament_type=tray.tray_type or None,
+                            color=tray.tray_color[:6] if tray.tray_color else None,
+                        )
                     )
                 elif spool_tag:
                     errors.append(f"Spool not found in Spoolman: AMS {ams_id}:{tray.tray_id}")
@@ -421,6 +473,11 @@ async def sync_all_printers(
     total_synced = 0
     all_skipped: list[SkippedSpool] = []
     all_errors = []
+
+    from backend.app.api.routes.settings import get_setting
+
+    _auto_add_raw = await get_setting(db, "auto_add_unknown_rfid")
+    auto_add_unknown_rfid = _auto_add_raw is None or _auto_add_raw.lower() == "true"
 
     # OPTIMIZATION: Fetch all spools once before processing ALL printers/trays
     # This eliminates redundant API calls across all printers
@@ -528,6 +585,7 @@ async def sync_all_printers(
                         cached_spools=cached_spools,
                         inventory_remaining=inv_remaining,
                         spoolman_spool_id_hint=hint,
+                        auto_add_unknown_rfid=auto_add_unknown_rfid,
                     )
                     if sync_result:
                         total_synced += 1
@@ -537,6 +595,15 @@ async def sync_all_printers(
                             if not spool_exists:
                                 cached_spools.append(sync_result)
                                 logger.debug("Added newly created spool %s to cache", sync_result["id"])
+                    elif spool_tag and not auto_add_unknown_rfid:
+                        all_skipped.append(
+                            SkippedSpool(
+                                location=f"{printer.name} AMS {ams_id} T{tray.tray_id}",
+                                reason="Auto-add disabled; add to inventory manually",
+                                filament_type=tray.tray_type or None,
+                                color=tray.tray_color[:6] if tray.tray_color else None,
+                            )
+                        )
                     elif spool_tag:
                         all_errors.append(f"Spool not found in Spoolman: {printer.name} AMS {ams_id}:{tray.tray_id}")
                     elif not hint:
@@ -874,40 +941,79 @@ async def link_spool(
 
             mqtt_client = printer_manager.get_client(p_id)
             if mqtt_client:
-                tray_type = mapped.get("material") or ""
+                # Spoolman's material is free text, so it arrives as whatever
+                # the user typed there -- "PLA+", "PolyTerra PLA". The sub-brand
+                # keeps that wording; the slot's type has to be one the printer
+                # and the slicer know (issue #2902).
+                material = mapped.get("material") or ""
+                tray_type = printer_filament_type(material)
                 brand = mapped.get("brand") or ""
                 subtype = mapped.get("subtype") or ""
                 if brand:
-                    tray_sub_brands = f"{brand} {tray_type} {subtype}".strip()
+                    tray_sub_brands = f"{brand} {material} {subtype}".strip()
                 elif subtype:
-                    tray_sub_brands = f"{tray_type} {subtype}".strip()
+                    tray_sub_brands = f"{material} {subtype}".strip()
                 else:
-                    tray_sub_brands = tray_type
+                    tray_sub_brands = material
 
                 tray_color = (mapped.get("rgba") or "808080FF").upper()
                 if len(tray_color) == 6:
                     tray_color = tray_color + "FF"
 
-                material_upper = tray_type.upper().strip()
-                tray_info_idx = (
-                    GENERIC_FILAMENT_IDS.get(material_upper)
-                    or GENERIC_FILAMENT_IDS.get(material_upper.split("-")[0].split(" ")[0])
-                    or ""
-                )
-                setting_id = ""
-                temp_defaults = MATERIAL_TEMPS.get(material_upper, (200, 240))
-                temp_min = mapped.get("nozzle_temp_min") or temp_defaults[0]
-                temp_max = temp_defaults[1]
-
                 # Pull printer state via printer_manager (mqtt_client.printer_state
                 # was a non-existent attribute — the hasattr check silently
                 # returned None, defeating every state-based lookup below).
                 state = printer_manager.get_status(p_id)
-                nozzle_diameter = "0.4"
-                if state and state.nozzles:
-                    nd = state.nozzles[0].nozzle_diameter
-                    if nd:
-                        nozzle_diameter = nd
+                slot_nozzle = resolve_slot_nozzle(state, a_id, t_id, printer_manager.get_model(p_id))
+                nozzle_diameter = slot_nozzle.diameter
+
+                # Resolve the spool's own preset before falling back to a
+                # generic material id. This path used to skip that entirely and
+                # configure every linked slot as generic PLA/PETG, so a spool
+                # with a preset set in inventory lost it the moment it was
+                # linked by tag — the same defect #1713 fixed on the assign
+                # path, in the function next door. The per-model override
+                # cascade applies here for the same reason it does there: the
+                # preset is bound to a printer model.
+                slot_slicer_filament, slot_slicer_filament_name = await resolve_spoolman_preset(
+                    db,
+                    spoolman_spool_id=spool_id,
+                    printer_model=printer_manager.get_model(p_id),
+                    nozzle_diameter=nozzle_diameter,
+                    fallback_filament=mapped.get("slicer_filament"),
+                    fallback_name=mapped.get("slicer_filament_name"),
+                )
+                tray_info_idx, setting_id, sub_brand_override, type_override = await resolve_slicer_filament(
+                    db=db,
+                    current_user=None,
+                    slicer_filament=slot_slicer_filament,
+                    slicer_filament_name=slot_slicer_filament_name,
+                    material=material,
+                )
+                if sub_brand_override:
+                    tray_sub_brands = sub_brand_override
+                if type_override:
+                    tray_type = printer_filament_type(type_override)
+
+                # The spool's own wording is tried first and the reduced type
+                # only as a further fallback, so a material that already
+                # resolves keeps resolving to the same id: "PETG HF" has its
+                # own generic preset (GFG96) that reducing it to "PETG" would
+                # trade away for GFG99.
+                material_upper = material.upper().strip()
+                if not tray_info_idx:
+                    tray_info_idx = (
+                        GENERIC_FILAMENT_IDS.get(material_upper)
+                        or GENERIC_FILAMENT_IDS.get(material_upper.split("-")[0].split(" ")[0])
+                        or GENERIC_FILAMENT_IDS.get(tray_type.upper())
+                        or ""
+                    )
+                if tray_info_idx and not setting_id:
+                    setting_id = filament_id_to_setting_id(tray_info_idx)
+
+                temp_defaults = nozzle_temp_range(material, tray_type)
+                temp_min = mapped.get("nozzle_temp_min") or temp_defaults[0]
+                temp_max = temp_defaults[1]
 
                 kp_result = await db.execute(
                     select(SpoolmanKProfile).where(
@@ -916,12 +1022,7 @@ async def link_spool(
                     )
                 )
                 kp_rows = kp_result.scalars().all()
-                slot_extruder = None
-                if state and state.ams_extruder_map:
-                    if a_id == 255:
-                        slot_extruder = 1 - t_id
-                    else:
-                        slot_extruder = state.ams_extruder_map.get(str(a_id))
+                slot_extruder = slot_nozzle.extruder
 
                 # Prefer exact extruder match, fall back to extruder-agnostic kp
                 # for the same nozzle. Hard-skip on extruder mismatch silently
@@ -931,6 +1032,8 @@ async def link_spool(
                 fallback_kp = None
                 for kp in kp_rows:
                     if kp.nozzle_diameter != nozzle_diameter or kp.cali_idx is None:
+                        continue
+                    if not slot_nozzle.flow_matches(kp.nozzle_type):
                         continue
                     if slot_extruder is not None and kp.extruder is not None and kp.extruder == slot_extruder:
                         exact_kp = kp
@@ -1108,3 +1211,119 @@ async def unlink_spool(
 
     logger.info("Unlinked Spoolman spool %s", spool_id)
     return {"success": True, "message": f"Spool {spool_id} unlinked from AMS"}
+
+
+class CreateSpoolFromSlotRequest(BaseModel):
+    printer_id: int
+    ams_id: int
+    tray_id: int
+
+
+@router.post("/spools/from-slot")
+async def create_spool_from_slot(
+    req: CreateSpoolFromSlotRequest,
+    db: AsyncSession = Depends(get_db),
+    _: User | None = RequirePermissionIfAuthEnabled(Permission.FILAMENTS_UPDATE),
+):
+    """Explicit user action: create a Spoolman spool from an AMS slot's current tray data.
+
+    Used by the "+ Add to inventory" affordance when auto_add_unknown_rfid is disabled —
+    the user looked at the slot and chose to register it. Calls sync_ams_tray with the
+    auto-add override on so the spool is created even when the global setting is off.
+    """
+    sm = await get_spoolman_settings(db)
+    if not sm["enabled"]:
+        raise HTTPException(status_code=400, detail="Spoolman integration is not enabled")
+
+    client = await get_spoolman_client()
+    if not client:
+        if sm["url"]:
+            client = await init_spoolman_client(sm["url"])
+        else:
+            raise HTTPException(status_code=400, detail="Spoolman URL is not configured")
+
+    if not await client.health_check():
+        raise HTTPException(status_code=503, detail="Spoolman is not reachable")
+
+    result = await db.execute(select(Printer).where(Printer.id == req.printer_id))
+    printer = result.scalar_one_or_none()
+    if not printer:
+        raise HTTPException(status_code=404, detail="Printer not found")
+
+    state = printer_manager.get_status(req.printer_id)
+    if not state or not state.raw_data:
+        raise HTTPException(status_code=404, detail="Printer not connected or no state available")
+
+    ams_data = state.raw_data.get("ams")
+    ams_units: list[dict] = []
+    if isinstance(ams_data, list):
+        ams_units = ams_data
+    elif isinstance(ams_data, dict):
+        if "ams" in ams_data and isinstance(ams_data["ams"], list):
+            ams_units = ams_data["ams"]
+        elif "tray" in ams_data:
+            ams_units = [{"id": 0, "tray": ams_data.get("tray", [])}]
+
+    tray = None
+    for unit in ams_units:
+        if not isinstance(unit, dict):
+            continue
+        if int(unit.get("id", -1)) != req.ams_id:
+            continue
+        for t in unit.get("tray", []):
+            if isinstance(t, dict) and int(t.get("id", -1)) == req.tray_id:
+                tray = client.parse_ams_tray(req.ams_id, t)
+                break
+        if tray:
+            break
+
+    if not tray:
+        raise HTTPException(status_code=400, detail="Slot is empty or has no readable tray data")
+
+    # Same ghost-spool guard as the inventory route: no tag → no stable
+    # identity → confirm would just create a fresh Spoolman row per push.
+    from backend.app.services.spool_tag_matcher import is_valid_tag
+
+    if not is_valid_tag(tray.tag_uid or "", tray.tray_uuid or ""):
+        raise HTTPException(status_code=400, detail="Slot has no RFID tag")
+
+    sync_result = await client.sync_ams_tray(
+        tray,
+        printer.name,
+        disable_weight_sync=True,
+        auto_add_unknown_rfid=True,
+    )
+    if not sync_result:
+        raise HTTPException(status_code=500, detail="Spoolman did not create a spool from the slot")
+
+    # Persist the slot assignment so the new spool shows on the slot tile.
+    # If this fails, surface a 500 — silently returning success while the
+    # binding rolled back leaves the user thinking the spool was added,
+    # then watching the modal re-fire on the next MQTT push.
+    if sync_result.get("id"):
+        try:
+            await db.execute(
+                text(
+                    "INSERT INTO spoolman_slot_assignments"
+                    " (printer_id, ams_id, tray_id, spoolman_spool_id)"
+                    " VALUES (:printer_id, :ams_id, :tray_id, :spool_id)"
+                    " ON CONFLICT(printer_id, ams_id, tray_id)"
+                    " DO UPDATE SET spoolman_spool_id = excluded.spoolman_spool_id"
+                ),
+                {
+                    "printer_id": req.printer_id,
+                    "ams_id": req.ams_id,
+                    "tray_id": req.tray_id,
+                    "spool_id": sync_result["id"],
+                },
+            )
+            await db.commit()
+        except Exception as exc:
+            await db.rollback()
+            logger.exception("Failed to persist Spoolman slot assignment")
+            raise HTTPException(
+                status_code=500,
+                detail=f"Spool created in Spoolman but slot assignment failed: {exc}",
+            ) from exc
+
+    return {"success": True, "spool_id": sync_result.get("id")}

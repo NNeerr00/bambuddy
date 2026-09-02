@@ -15,26 +15,29 @@ from sqlalchemy.orm import selectinload
 
 from backend.app.api.routes.settings import get_external_login_url
 from backend.app.core.auth import (
-    ACCESS_TOKEN_EXPIRE_MINUTES,
     ALGORITHM,
     SECRET_KEY,
     Permission,
     RequirePermissionIfAuthEnabled,
     _is_token_fresh,
     _validate_api_key,
+    apikey_effective_permissions,
     authenticate_user,
     authenticate_user_by_email,
     create_access_token,
+    create_websocket_token,
     get_current_active_user,
     get_password_hash,
     get_user_by_email,
     get_user_by_username,
     is_jti_revoked,
+    resolve_apikey_owner,
+    resolve_session_max_minutes,
     revoke_jti,
     security,
 )
 from backend.app.core.database import async_session, get_db
-from backend.app.core.permissions import ALL_PERMISSIONS
+from backend.app.core.oidc_env import env_bool
 from backend.app.models.auth_ephemeral import AuthEphemeralToken, AuthRateLimitEvent, EventType, TokenType
 from backend.app.models.group import Group
 from backend.app.models.settings import Settings
@@ -66,6 +69,7 @@ from backend.app.services.email_service import (
     save_smtp_settings,
     send_email,
 )
+from backend.app.services.finance_defaults import ensure_user_finance_defaults
 
 _logger = logging.getLogger(__name__)
 
@@ -86,17 +90,47 @@ def _user_to_response(user: User) -> UserResponse:
     )
 
 
-def _api_key_to_user_response(api_key) -> UserResponse:
-    """Create a synthetic admin UserResponse for a valid API key."""
+async def _api_key_to_user_response(db: AsyncSession, api_key) -> UserResponse:
+    """Describe a valid API key as the identity it actually carries (#1894).
+
+    Until 0.2.5 this returned a synthetic admin: ``id=0``, ``role="admin"``,
+    ``is_admin=True`` and every permission in the enum. That was wrong in both
+    directions. A key cannot perform administrative operations at all --
+    ``_check_apikey_permissions`` denies every permission that is not in the
+    scope allowlist -- so a client that builds its UI from this response (which
+    is exactly what a native client does) rendered admin actions that 403 on
+    use, and had no way to learn the id its own prints are filed under.
+
+    Now: identity comes from the key's owner, and ``permissions`` is the set the
+    key can genuinely exercise. ``is_admin`` is always False because no key can
+    reach an administrative route regardless of who owns it.
+
+    Legacy keys predating per-user ownership (``user_id IS NULL``) have no
+    identity to report, so they keep ``id=0`` and the ``api-key:`` username --
+    but they stop claiming admin. ``created_at`` describes the credential in
+    both branches, unchanged.
+    """
+    # Same resolution the permission gate uses, so what is reported here and
+    # what is enforced there cannot drift -- including the 403 when the owner
+    # has been deactivated, which makes the key dead rather than anonymous.
+    owner = await resolve_apikey_owner(db, api_key)
     return UserResponse(
-        id=0,
-        username=f"api-key:{api_key.key_prefix}",
+        id=owner.id if owner else 0,
+        username=owner.username if owner else f"api-key:{api_key.key_prefix}",
+        # Withheld on purpose: the owner's email is not needed to resolve
+        # identity, and this response is reachable by anyone holding the key.
         email=None,
-        role="admin",
+        # Deprecated free-text field; "user" is the existing value meaning
+        # "not an admin". Inventing an "api_key" role here would put a third
+        # value into a field callers compare against string literals.
+        role="user",
         is_active=True,
-        is_admin=True,
+        is_admin=False,
+        auth_source=getattr(owner, "auth_source", "local") if owner else "local",
+        # The key is not a group member -- listing the owner's groups would
+        # imply capabilities the key does not inherit.
         groups=[],
-        permissions=sorted(ALL_PERMISSIONS),
+        permissions=apikey_effective_permissions(api_key, owner),
         created_at=api_key.created_at.isoformat(),
     )
 
@@ -109,6 +143,23 @@ def _api_key_to_user_response(api_key) -> UserResponse:
 _TRUSTED_PROXY_IPS: frozenset[str] = frozenset(
     ip.strip() for ip in os.environ.get("TRUSTED_PROXY_IPS", "").split(",") if ip.strip()
 )
+
+
+# #1589: read at call time, not import time, so tests can monkeypatch os.environ
+# between cases without re-importing the module.
+def _local_login_env_bypass() -> bool:
+    """Return True when ``BAMBUDDY_LOCAL_LOGIN`` env var is set truthy.
+
+    Bypasses the ``local_login_enabled`` DB setting on the local-credentials
+    code path AND the forgot-password endpoint so a server admin can recover
+    an install whose SSO provider is unreachable. Accepted truthy values:
+    ``true``, ``1``, ``yes`` (case-insensitive).
+    """
+    # strict=False: this runs on the login/forgot-password request path, not at
+    # startup. An unrecognized value must fall back to "off" (the safe default),
+    # never raise -- a 500 on the recovery endpoint is the opposite of what this
+    # bypass is for.
+    return env_bool("BAMBUDDY_LOCAL_LOGIN", False, strict=False)
 
 
 def _get_client_ip(request: Request) -> str:
@@ -175,9 +226,15 @@ async def set_advanced_auth_enabled(db: AsyncSession, enabled: bool) -> None:
 
 async def set_auth_enabled(db: AsyncSession, enabled: bool) -> None:
     """Set authentication enabled status."""
+    from backend.app.core.auth import invalidate_auth_enabled_cache
     from backend.app.core.db_dialect import upsert_setting
 
     await upsert_setting(db, Settings, "auth_enabled", "true" if enabled else "false")
+    # Drop the cached auth-enabled flag so the change takes effect immediately
+    # instead of after the TTL (issue #2572). Safe pre-commit: only enabled=True
+    # is ever cached, and the newly-enabled True isn't visible to other sessions
+    # until this transaction commits, so no stale value can be re-cached here.
+    invalidate_auth_enabled_cache()
     # Note: Don't commit here - let get_db handle it or commit explicitly in the route
 
 
@@ -273,12 +330,44 @@ async def setup_auth(request: SetupRequest, db: AsyncSession = Depends(get_db)):
                     db.add(admin_user)
                     logger.info("Admin user added to session: %s", request.admin_username)
                     admin_created = True
-                except Exception as e:
+                except Exception as e:  # SEC-AUTH-EXC: rollback + raise 500 (fail-closed); no user is created on error
                     await db.rollback()
                     logger.error("Failed to create admin user: %s", e, exc_info=True)
                     raise HTTPException(
                         status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
                         detail="Failed to create admin user",
+                    )
+
+        if request.auth_enabled:
+            # Enabling auth flips cloud-credential storage from the global
+            # Settings rows to User.cloud_token. Carry any token linked while
+            # auth was off across to the owning admin, or /cloud/* silently
+            # degrades to local presets with no indication anything broke
+            # (#2530). Only migrate when there is exactly one obvious owner:
+            # handing another admin's session a Bambu credential is not a
+            # guess worth making.
+            from backend.app.api.routes.cloud import (
+                get_stored_token,
+                migrate_global_cloud_token_to_user,
+            )
+
+            if admin_created:
+                cloud_owner = admin_user
+            elif len(existing_admin_users) == 1:
+                cloud_owner = existing_admin_users[0]
+            else:
+                cloud_owner = None
+
+            if cloud_owner is not None:
+                if await migrate_global_cloud_token_to_user(db, cloud_owner):
+                    logger.info("Migrated global Bambu Cloud credentials to admin '%s'", cloud_owner.username)
+            else:
+                global_token, _, _ = await get_stored_token(db, None)
+                if global_token:
+                    logger.warning(
+                        "A Bambu Cloud account is linked globally but %s admins exist; "
+                        "leaving it unassigned. Re-link the account from Settings after login.",
+                        len(existing_admin_users),
                     )
 
         # Set auth enabled and mark setup as completed
@@ -294,7 +383,7 @@ async def setup_auth(request: SetupRequest, db: AsyncSession = Depends(get_db)):
         return SetupResponse(auth_enabled=request.auth_enabled, admin_created=admin_created)
     except HTTPException:
         raise
-    except Exception as e:
+    except Exception as e:  # SEC-AUTH-EXC: rollback + raise 500 (fail-closed); setup state stays unchanged
         logger.error("Setup error: %s", e, exc_info=True)
         await db.rollback()
         raise HTTPException(
@@ -335,11 +424,19 @@ async def disable_auth(
         )
 
     try:
+        # Mirror of the migration in setup_auth: with auth off the cloud routes
+        # read the global Settings rows and never look at User.cloud_token, so
+        # hand this admin's credential over rather than stranding it (#2530).
+        from backend.app.api.routes.cloud import migrate_user_cloud_token_to_global
+
+        if await migrate_user_cloud_token_to_global(db, user):
+            logger.info("Migrated Bambu Cloud credentials from admin '%s' to global storage", user.username)
+
         await set_auth_enabled(db, False)
         await db.commit()
         logger.info("Authentication disabled by admin user: %s", user.username)
         return {"message": "Authentication disabled successfully", "auth_enabled": False}
-    except Exception as e:
+    except Exception as e:  # SEC-AUTH-EXC: rollback + raise 500 (fail-closed); auth_enabled stays at its prior value
         await db.rollback()
         logger.error("Failed to disable authentication: %s", e, exc_info=True)
         raise HTTPException(
@@ -377,6 +474,13 @@ async def login(raw_request: Request, request: LoginRequest, response: Response,
     client_ip = _get_client_ip(raw_request)
     await check_rate_limit(db, client_ip, event_type=EventType.LOGIN_IP, max_attempts=20)
 
+    # Initialize `user` up front so every downstream branch can read/write
+    # it without UnboundLocalError. The LDAP success path sets it inside its
+    # own block; the local-credentials and email-credentials paths set it
+    # below. The original code relied on the local-credentials path running
+    # unconditionally to bind `user`; #1589 made that path skippable, so the
+    # init has to live here.
+    user = None
     # Check if LDAP is enabled
     ldap_user = None
     ldap_settings = await _get_ldap_settings(db)
@@ -408,18 +512,39 @@ async def login(raw_request: Request, request: LoginRequest, response: Response,
                     if user and ldap_user:
                         # Update email and group mappings on each login
                         await _sync_ldap_user(db, user, ldap_user, ldap_config)
-        except Exception as e:
+                        # Keep finance defaults idempotently in sync for LDAP users
+                        # (wallet + private cost center + self-membership).
+                        await ensure_user_finance_defaults(db, user)
+        except Exception as e:  # SEC-AUTH-EXC: LDAP failure sets ldap_user=None, downstream local-auth path runs with its own credential check (no implicit grant)
             import logging
 
             logging.getLogger(__name__).warning("LDAP authentication error, falling back to local: %s", e)
             ldap_user = None
 
+    # #1589: local username/password gate. LDAP keeps its own switch
+    # (ldap_enabled) and is not affected — a delegated directory has its
+    # own policy and lockouts and is closer to SSO than to local creds.
+    # The env-var BAMBUDDY_LOCAL_LOGIN=true bypasses this gate so a server
+    # admin can recover an install whose SSO provider is unreachable
+    # without editing the DB.
+    from backend.app.models.settings import Settings as _Settings_for_local_login
+
+    local_login_allowed = ldap_user is not None or _local_login_env_bypass()
+    if not local_login_allowed:
+        setting_row = await db.execute(
+            select(_Settings_for_local_login).where(_Settings_for_local_login.key == "local_login_enabled")
+        )
+        row = setting_row.scalar_one_or_none()
+        # Default True when the row is absent — matches AppSettings default
+        # so fresh installs and tests behave like every release before #1589.
+        local_login_allowed = row is None or row.value.lower() == "true"
+
     # Try username-based authentication (skip if already authenticated via LDAP)
-    if not ldap_user:
+    if not ldap_user and local_login_allowed:
         user = await authenticate_user(db, request.username, request.password)
 
     # If username auth failed and advanced auth is enabled, try email-based authentication
-    if not user and not ldap_user:
+    if not user and not ldap_user and local_login_allowed:
         advanced_auth = await is_advanced_auth_enabled(db)
         if advanced_auth:
             user = await authenticate_user_by_email(db, request.username, request.password)
@@ -427,6 +552,11 @@ async def login(raw_request: Request, request: LoginRequest, response: Response,
     if not user:
         await record_failed_attempt(db, request.username, event_type=EventType.LOGIN_ATTEMPT)
         await record_failed_attempt(db, client_ip, event_type=EventType.LOGIN_IP)
+        # Same generic 401 either way — never tell the client whether the
+        # username exists or whether local login was disabled. The Settings
+        # UI and /auth/advanced-auth/status are the channels for that state;
+        # leaking it here would help credential-stuffing distinguish "local
+        # disabled" from "wrong password" across an install fleet.
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Incorrect username or password",
@@ -494,8 +624,9 @@ async def login(raw_request: Request, request: LoginRequest, response: Response,
             two_fa_methods=methods,
         )
 
-    # No 2FA — issue full token immediately
-    access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    # No 2FA — issue full token immediately. Session lifetime honours the
+    # admin-configurable ceiling (#1706); resolver clamps to [1h, 720h].
+    access_token_expires = timedelta(minutes=await resolve_session_max_minutes(db))
     access_token = create_access_token(data={"sub": user.username}, expires_delta=access_token_expires)
 
     return LoginResponse(
@@ -503,6 +634,29 @@ async def login(raw_request: Request, request: LoginRequest, response: Response,
         token_type="bearer",
         user=_user_to_response(user),
     )
+
+
+@router.post("/ws-token")
+async def mint_websocket_token(
+    current_user: User | None = RequirePermissionIfAuthEnabled(Permission.WEBSOCKET_CONNECT),
+):
+    """Mint a short-lived token for ``/api/v1/ws`` connections (GHSA-r2qv follow-up).
+
+    The WebSocket endpoint cannot read ``Authorization`` headers from
+    browsers (the WebSocket handshake does not let JS attach custom
+    headers), so we use the same opaque-token-in-query-param pattern
+    as ``/camera/stream`` — the token is minted here behind the standard
+    permission gate, then appended as ``?token=<value>`` on the
+    ``ws://...`` URL. The WebSocket endpoint validates it *before*
+    calling ``websocket.accept()``.
+
+    Returns ``{"token": <opaque string>}``. The token is valid for 60
+    minutes; the SPA refreshes it on reconnect if expired. API keys can
+    mint tokens too — their scope flags decide whether ``WEBSOCKET_CONNECT``
+    passes via the standard allowlist (``can_read_status`` covers it).
+    """
+    username = current_user.username if current_user is not None else None
+    return {"token": await create_websocket_token(username)}
 
 
 @router.get("/me", response_model=UserResponse)
@@ -514,8 +668,9 @@ async def get_current_user_info(
     """Get current user information.
 
     Accepts JWT tokens (via Authorization: Bearer header) and API keys
-    (via X-API-Key header or Authorization: Bearer bb_xxx).
-    API keys return a synthetic admin user with all permissions.
+    (via X-API-Key header or Authorization: Bearer bb_xxx). API keys report
+    their owner's identity and the permissions the key can actually exercise
+    -- see ``_api_key_to_user_response``.
     """
     import jwt
     from jwt.exceptions import PyJWTError as JWTError
@@ -524,7 +679,7 @@ async def get_current_user_info(
     if x_api_key:
         api_key = await _validate_api_key(db, x_api_key)
         if api_key:
-            return _api_key_to_user_response(api_key)
+            return await _api_key_to_user_response(db, api_key)
 
     # Check for Bearer token (could be JWT or API key)
     if credentials is not None:
@@ -533,7 +688,7 @@ async def get_current_user_info(
         if token.startswith("bb_"):
             api_key = await _validate_api_key(db, token)
             if api_key:
-                return _api_key_to_user_response(api_key)
+                return await _api_key_to_user_response(db, api_key)
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid API key",
@@ -551,7 +706,7 @@ async def get_current_user_info(
                     headers={"WWW-Authenticate": "Bearer"},
                 )
             jti: str | None = payload.get("jti")
-            if not jti or await is_jti_revoked(jti):  # B1: logout bypass fix
+            if not jti or await is_jti_revoked(jti, db):  # B1: logout bypass fix
                 raise HTTPException(
                     status_code=status.HTTP_401_UNAUTHORIZED,
                     detail="Could not validate credentials",
@@ -619,7 +774,7 @@ async def logout(
                 expires_at = datetime.fromtimestamp(exp, tz=timezone.utc)
                 try:
                     await revoke_jti(jti, expires_at, username)
-                except Exception as exc:
+                except Exception as exc:  # SEC-AUTH-EXC: JTI-revoke failure on logout is logged only; logout removes access, never grants it (token stays valid until natural expiry — degraded but never escalation)
                     _logger.error("Failed to revoke JTI on logout for user %s: %s", username, exc)
         except PyJWTError:
             client_ip = _get_client_ip(raw_request)
@@ -664,7 +819,7 @@ async def test_smtp_connection(
 
         logger.info(f"Test email sent successfully to {test_request.test_recipient}")
         return TestSMTPResponse(success=True, message="Test email sent successfully")
-    except Exception as e:
+    except Exception as e:  # SEC-AUTH-EXC: SMTP test diagnostic returns success=False; no auth-relevant outcome (route is admin-gated by SETTINGS_UPDATE upstream)
         logger.error("Failed to send test email: %s", e)
         return TestSMTPResponse(success=False, message="Failed to send test email")
 
@@ -698,7 +853,7 @@ async def save_smtp_config(
         await db.commit()
         logger.info(f"SMTP settings updated by admin user: {current_user.username if current_user else 'anonymous'}")
         return {"message": "SMTP settings saved successfully"}
-    except Exception as e:
+    except Exception as e:  # SEC-AUTH-EXC: rollback + raise 500 (fail-closed); SMTP settings unchanged on error
         await db.rollback()
         logger.error("Failed to save SMTP settings: %s", e)
         raise HTTPException(
@@ -743,7 +898,7 @@ async def enable_advanced_auth(
         await db.commit()
         logger.info(f"Advanced authentication enabled by admin user: {user.username}")
         return {"message": "Advanced authentication enabled successfully", "advanced_auth_enabled": True}
-    except Exception as e:
+    except Exception as e:  # SEC-AUTH-EXC: rollback + raise 500 (fail-closed); advanced-auth setting unchanged on error
         await db.rollback()
         logger.error("Failed to enable advanced authentication: %s", e)
         raise HTTPException(
@@ -777,7 +932,7 @@ async def disable_advanced_auth(
         await db.commit()
         logger.info(f"Advanced authentication disabled by admin user: {user.username}")
         return {"message": "Advanced authentication disabled successfully", "advanced_auth_enabled": False}
-    except Exception as e:
+    except Exception as e:  # SEC-AUTH-EXC: rollback + raise 500 (fail-closed); advanced-auth setting unchanged on error
         await db.rollback()
         logger.error("Failed to disable advanced authentication: %s", e)
         raise HTTPException(
@@ -788,12 +943,39 @@ async def disable_advanced_auth(
 
 @router.get("/advanced-auth/status")
 async def get_advanced_auth_status(db: AsyncSession = Depends(get_db)):
-    """Get advanced authentication status."""
+    """Get advanced authentication status.
+
+    Surfaces ``local_login_enabled`` and ``autologin_provider_id`` (#1589)
+    so the LoginPage can decide whether to render the credentials form and
+    whether to redirect unauthenticated visitors directly to an SSO
+    provider, in a single query. ``BAMBUDDY_LOCAL_LOGIN=true`` flips the
+    reported value back to True so the recovery path is visible.
+    """
+    from backend.app.models.oidc_provider import OIDCProvider
+    from backend.app.models.settings import Settings as _Settings_for_local_login
+
     advanced_auth_enabled = await is_advanced_auth_enabled(db)
     smtp_configured = await get_smtp_settings(db) is not None
+
+    setting_row = await db.execute(
+        select(_Settings_for_local_login).where(_Settings_for_local_login.key == "local_login_enabled")
+    )
+    row = setting_row.scalar_one_or_none()
+    db_local_enabled = row is None or row.value.lower() == "true"
+    local_login_enabled = db_local_enabled or _local_login_env_bypass()
+
+    # Autologin provider must be both flagged AND enabled — disabling a
+    # provider should not silently keep redirecting visitors to it.
+    autologin = await db.execute(
+        select(OIDCProvider.id).where(OIDCProvider.is_autologin.is_(True), OIDCProvider.is_enabled.is_(True)).limit(1)
+    )
+    autologin_provider_id = autologin.scalar_one_or_none()
+
     return {
         "advanced_auth_enabled": advanced_auth_enabled,
         "smtp_configured": smtp_configured,
+        "local_login_enabled": local_login_enabled,
+        "autologin_provider_id": autologin_provider_id,
     }
 
 
@@ -826,7 +1008,7 @@ async def _send_reset_email_or_delete_token(
     try:
         send_email(smtp_settings, to_email, subject, text_body, html_body)
         _logger.info("Password reset email sent (%s) to %s", log_label, to_email)
-    except Exception as exc:
+    except Exception as exc:  # SEC-AUTH-EXC: email-send failure → defensive token cleanup so a stuck token doesn't block re-request; no access granted, just frees future workflow
         _logger.error(
             "Password reset email failed (%s) to %s — deleting token to unblock re-request: %s",
             log_label,
@@ -842,7 +1024,7 @@ async def _send_reset_email_or_delete_token(
                     )
                 )
                 await db.commit()
-        except Exception as db_exc:
+        except Exception as db_exc:  # SEC-AUTH-EXC: nested cleanup failure logged only; no access decision made in this branch (already handling a prior failure)
             _logger.error("Failed to delete reset token after send failure: %s", db_exc)
 
 
@@ -859,6 +1041,21 @@ async def forgot_password(
     secure link instead of a plaintext temporary password.  The new password is
     set only when the user clicks the link and POSTs to /forgot-password/confirm.
     """
+    # #1589: forgot-password is a local-credentials flow — useless when local
+    # login is disabled (the reset wouldn't grant access anyway). Same gate as
+    # /auth/login, with the same env-var bypass for SSO-broken recovery.
+    if not _local_login_env_bypass():
+        from backend.app.models.settings import Settings as _Settings_for_local_login
+
+        setting_row = await db.execute(
+            select(_Settings_for_local_login).where(_Settings_for_local_login.key == "local_login_enabled")
+        )
+        row = setting_row.scalar_one_or_none()
+        if row is not None and row.value.lower() != "true":
+            raise HTTPException(
+                status_code=status.HTTP_403_FORBIDDEN,
+                detail="Local login is disabled — use SSO instead.",
+            )
     # Check if advanced auth is enabled
     advanced_auth = await is_advanced_auth_enabled(db)
     if not advanced_auth:
@@ -967,7 +1164,7 @@ async def forgot_password(
                 "forgot_password",
             )
             _logger.info("Password reset email queued for %s", user.email)
-        except Exception as e:
+        except Exception as e:  # SEC-AUTH-EXC: forgot-password response is intentionally generic regardless of outcome (user-enumeration defence); email failure does not grant access
             _logger.error("Failed to send password reset email: %s", e)
             # Don't reveal error to caller for security
 
@@ -1114,7 +1311,7 @@ async def reset_user_password(
 
         _logger.info("Admin password reset link queued for user '%s' by admin '%s'", user.username, admin_user.username)
         return ResetPasswordResponse(message=f"Password reset link sent to {user.email}")
-    except Exception as e:
+    except Exception as e:  # SEC-AUTH-EXC: rollback + raise 500 (fail-closed); reset token state unchanged on error
         await db.rollback()
         _logger.error("Failed to send admin password reset for user '%s': %s", user.username, e)
         raise HTTPException(
@@ -1180,6 +1377,8 @@ async def _provision_ldap_user(db: AsyncSession, ldap_user, ldap_config) -> User
         new_user.groups = list(groups_result.scalars().all())
 
     db.add(new_user)
+    await db.flush()
+    await ensure_user_finance_defaults(db, new_user)
     await db.commit()
     await db.refresh(new_user)
     logger.info("Auto-provisioned LDAP user: %s (groups: %s)", new_user.username, mapped_group_names)
@@ -1354,7 +1553,7 @@ async def search_ldap_directory(
 
     try:
         results = search_ldap_users(config, query, limit=25)
-    except Exception as e:
+    except Exception as e:  # SEC-AUTH-EXC: raise 503 (fail-closed); route gated upstream by USERS_CREATE permission so detail leak is admin-only
         _logger.exception("LDAP directory search failed")
         # Admin-only endpoint — surface the underlying reason so the operator
         # can fix it (auth_middleware already restricted access to USERS_CREATE).
@@ -1430,7 +1629,7 @@ async def provision_ldap_user(
     # "username doesn't exist in the directory" in the UI.
     try:
         ldap_user = lookup_ldap_user(config, username)
-    except Exception as e:
+    except Exception as e:  # SEC-AUTH-EXC: raise 503 (fail-closed); LDAP provision never succeeds on lookup failure
         _logger.exception("LDAP lookup failed during provision")
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -1467,10 +1666,14 @@ async def provision_ldap_user(
 # =============================================================================
 # Long-lived camera-stream tokens (#1108)
 # =============================================================================
-# Camera-only V1. Issue scope: a token a user can paste into Home Assistant /
-# Frigate / a kiosk and have it keep working for days/weeks rather than
-# refreshing the 60-minute ephemeral token. Permission gate: CAMERA_VIEW
-# (same blast radius as the existing 60-min token-mint endpoint).
+# A token a user can paste into Home Assistant / Frigate / a kiosk and have it
+# keep working for days/weeks rather than refreshing the 60-minute ephemeral
+# token. Permission gate: CAMERA_VIEW (same blast radius as the existing 60-min
+# token-mint endpoint).
+#
+# Two scopes, both minted here — see ALLOWED_SCOPES in services/long_lived_tokens
+# for what each one reaches: "camera_stream" (video only) and "camwall" (video
+# plus the Cam Wall's read-only tile metadata, #2531).
 
 
 def _long_lived_token_to_response(record, *, plaintext: str | None = None) -> dict:

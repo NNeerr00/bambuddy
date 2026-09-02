@@ -1,7 +1,7 @@
 """API routes for smart plug management."""
 
 import logging
-from datetime import datetime, timedelta, timezone
+from datetime import timedelta
 
 from fastapi import APIRouter, Body, Depends, HTTPException
 from pydantic import BaseModel
@@ -12,6 +12,7 @@ from backend.app.api.routes.settings import get_setting
 from backend.app.core.auth import RequirePermissionIfAuthEnabled
 from backend.app.core.database import get_db
 from backend.app.core.permissions import Permission
+from backend.app.core.tasks import spawn_background_task
 from backend.app.models.printer import Printer
 from backend.app.models.smart_plug import SmartPlug
 from backend.app.models.user import User
@@ -35,9 +36,11 @@ from backend.app.services.homeassistant import homeassistant_service
 from backend.app.services.mqtt_relay import mqtt_relay
 from backend.app.services.mqtt_smart_plug import subscribe_plug_to_mqtt
 from backend.app.services.notification_service import notification_service
+from backend.app.services.plug_energy_history import fill_derived_energy
 from backend.app.services.printer_manager import printer_manager
 from backend.app.services.rest_smart_plug import rest_smart_plug_service
 from backend.app.services.tasmota import tasmota_service
+from backend.app.utils.local_time import to_naive_utc, utcnow_naive
 
 logger = logging.getLogger(__name__)
 
@@ -135,6 +138,90 @@ async def create_smart_plug(
     return plug
 
 
+def _is_script_plug(plug: SmartPlug) -> bool:
+    """Whether the plug is a Home Assistant script rather than a switchable device."""
+    return bool(plug.plug_type == "homeassistant" and plug.ha_entity_id and plug.ha_entity_id.startswith("script."))
+
+
+def _can_be_switched(plug: SmartPlug) -> bool:
+    """Whether ``control_smart_plug`` can actually turn this plug on and off.
+
+    Two kinds cannot, and the card's on/off button is useless on both:
+
+    - A Home Assistant script. It can be run, not switched.
+    - An MQTT plug. Bambuddy subscribes to it and never publishes, so the
+      control endpoint rejects it outright as monitor-only -- and an MQTT plug
+      is exactly the kind that reports watts, so without this it would win the
+      power tiebreak below and take the row off a plug that can be switched.
+    """
+    return not _is_script_plug(plug) and plug.plug_type != "mqtt"
+
+
+def _reports_power(plug: SmartPlug) -> bool:
+    """Whether the plug is configured with somewhere to read watts from (#2830).
+
+    Read from the configuration rather than measured: this runs on every printer
+    card render, and probing each plug would mean an HTTP round trip per plug.
+    So it is approximate in both directions -- an HA plug with no dedicated power
+    sensor may still report watts from the switch entity's own
+    ``current_power_w`` attribute, and a Tasmota device without energy metering
+    is counted here as if it had it. Only a live read could tell, and this is
+    used solely to break a tie between plugs that are otherwise equally
+    eligible, so neither miss can decide anything on its own.
+    """
+    if plug.plug_type == "homeassistant":
+        return bool(plug.ha_power_entity)
+    if plug.plug_type == "mqtt":
+        return bool(plug.mqtt_power_topic or plug.mqtt_topic)
+    if plug.plug_type == "rest":
+        return bool(plug.rest_power_path)
+    return True  # Tasmota, whose firmware reports power when the hardware has it
+
+
+def _main_plug_rank(plug: SmartPlug) -> tuple:
+    """Sort key for choosing the printer's main power plug, best first (#2830).
+
+    A printer's plugs are not interchangeable. The card's Power row carries the
+    power on/off and auto-off-after-print controls, so it has to land on the plug
+    that actually feeds the printer -- pointing those at an exhaust fan is the
+    same harm #2629 fixed for the scheduler's power-on. Ordered:
+
+    1. It can be switched at all -- see ``_can_be_switched``. The row's buttons
+       are the point of it.
+    2. ``controls_printer_power`` -- the flag that says this plug feeds the
+       printer, as opposed to an accessory that merely follows the print cycle.
+    3. ``enabled`` -- a disabled plug ignores automation, so its auto-off toggle
+       would sit there doing nothing.
+    4. ``show_on_printer_card`` -- ranked, not filtered: excluding hidden plugs
+       outright would strip the Power row, and with it the on/off button, from a
+       printer whose only plug has the flag off. It sorts below the power flag
+       because a display preference must not hand power control to an accessory.
+    5. Reports power, so the row shows watts rather than "--" where there is a
+       choice.
+    6. Lowest id, so the answer never depends on row order. The query had no
+       ORDER BY at all, which on Postgres means a plain UPDATE can move a row and
+       silently swap which plug the card calls the printer's power.
+    """
+    return (
+        not _can_be_switched(plug),
+        not plug.controls_printer_power,
+        not plug.enabled,
+        not plug.show_on_printer_card,
+        not _reports_power(plug),
+        plug.id,
+    )
+
+
+def _pick_main_plug(plugs: list[SmartPlug]) -> SmartPlug | None:
+    """The plug the printer card shows as its power, or None if there are none."""
+    return min(plugs, key=_main_plug_rank, default=None)
+
+
+async def _plugs_for_printer(db: AsyncSession, printer_id: int) -> list[SmartPlug]:
+    result = await db.execute(select(SmartPlug).where(SmartPlug.printer_id == printer_id).order_by(SmartPlug.id))
+    return list(result.scalars().all())
+
+
 @router.get("/by-printer/{printer_id}", response_model=SmartPlugResponse | None)
 async def get_smart_plug_by_printer(
     printer_id: int,
@@ -143,23 +230,11 @@ async def get_smart_plug_by_printer(
 ):
     """Get the main smart plug assigned to a printer.
 
-    When multiple plugs are assigned (e.g., a regular plug + script),
-    returns the main (non-script) plug for power control.
+    When several plugs are assigned -- a printer outlet, an enclosure fan, a
+    script -- returns the one that best fits the card's power controls. See
+    ``_main_plug_rank`` for the order and why.
     """
-    result = await db.execute(select(SmartPlug).where(SmartPlug.printer_id == printer_id))
-    plugs = result.scalars().all()
-
-    if not plugs:
-        return None
-
-    # If multiple plugs, prefer the non-script one (main power plug)
-    for plug in plugs:
-        is_script = plug.plug_type == "homeassistant" and plug.ha_entity_id and plug.ha_entity_id.startswith("script.")
-        if not is_script:
-            return plug
-
-    # All are scripts, return the first one
-    return plugs[0]
+    return _pick_main_plug(await _plugs_for_printer(db, printer_id))
 
 
 @router.get("/by-printer/{printer_id}/scripts", response_model=list[SmartPlugResponse])
@@ -173,13 +248,25 @@ async def get_script_plugs_by_printer(
     Returns HA entities (switches, scripts, lights, etc.) for the printer that have
     show_on_printer_card enabled.
     Used to display action buttons alongside the main power plug.
+
+    A switchable main plug is left out: it is rendered directly above this row
+    with its own on/off button, so listing it here draws the same entity twice
+    (#2830). A script is not, because a printer whose only entities are scripts
+    falls back to showing one of them in the power row -- taking it out of this
+    row too would cost the one-click run it has always had there.
     """
-    result = await db.execute(select(SmartPlug).where(SmartPlug.printer_id == printer_id))
-    plugs = result.scalars().all()
+    plugs = await _plugs_for_printer(db, printer_id)
+    main_plug = _pick_main_plug(plugs)
+    duplicate_of_power_row = main_plug.id if main_plug and not _is_script_plug(main_plug) else None
 
     # Filter to HA entities with show_on_printer_card enabled
     ha_entities = [
-        plug for plug in plugs if plug.plug_type == "homeassistant" and plug.ha_entity_id and plug.show_on_printer_card
+        plug
+        for plug in plugs
+        if plug.plug_type == "homeassistant"
+        and plug.ha_entity_id
+        and plug.show_on_printer_card
+        and plug.id != duplicate_of_power_row
     ]
     return ha_entities
 
@@ -249,14 +336,16 @@ async def start_tasmota_scan(
 
     Auto-detects local network if no IP range provided.
     """
-    import asyncio
 
     # Auto-detect network
     from_ip, to_ip = get_local_network_range()
     timeout = request.timeout if request else 1.0
 
     # Start scan in background
-    asyncio.create_task(tasmota_scanner.scan_range(from_ip, to_ip, timeout))
+    spawn_background_task(
+        tasmota_scanner.scan_range(from_ip, to_ip, timeout),
+        name="tasmota-scan",
+    )
 
     # Return immediate status
     scanned, total = tasmota_scanner.progress
@@ -578,10 +667,11 @@ async def control_smart_plug(
         plug.last_state = expected_state
         if expected_state == "ON":
             plug.auto_off_executed = False  # Reset flag when manually turning on
-        elif expected_state == "OFF" and plug.printer_id:
-            # Mark printer offline immediately for faster UI update
+        elif expected_state == "OFF" and plug.printer_id and plug.controls_printer_power:
+            # Mark printer offline immediately for faster UI update. Skipped for
+            # accessory plugs, which are linked to a printer but don't feed it (#2629).
             printer_manager.mark_printer_offline(plug.printer_id)
-    plug.last_checked = datetime.now(timezone.utc)
+    plug.last_checked = utcnow_naive()
     await db.commit()
 
     # Trigger associated scripts if this is a main (non-script) plug
@@ -668,7 +758,7 @@ async def get_plug_status(
             # Update last state in database
             if is_reachable and data.state:
                 plug.last_state = data.state
-                plug.last_checked = datetime.now(timezone.utc)
+                plug.last_checked = utcnow_naive()
                 await db.commit()
 
             energy_data = None
@@ -703,7 +793,7 @@ async def get_plug_status(
     # Update last state in database
     if status["reachable"]:
         plug.last_state = status["state"]
-        plug.last_checked = datetime.now(timezone.utc)
+        plug.last_checked = utcnow_naive()
         await db.commit()
 
     # Fetch energy data if device is reachable
@@ -711,6 +801,11 @@ async def get_plug_status(
     if status["reachable"]:
         energy = await service.get_energy(plug)
         if energy:
+            # Most plugs report only a lifetime counter — a Shelly has no notion
+            # of "today" at all, and Home Assistant never reports "yesterday".
+            # Fill those in from the hourly snapshots (#2539). Tasmota, which
+            # knows its own daily figures, is left alone.
+            energy = await fill_derived_energy(db, plug.id, energy)
             energy_data = SmartPlugEnergy(**energy)
 
             # Check power alerts
@@ -732,10 +827,10 @@ async def check_power_alerts(plug: SmartPlug, current_power: float | None, db: A
     # Cooldown: don't alert more than once per 5 minutes
     cooldown_minutes = 5
     if plug.power_alert_last_triggered:
-        last_triggered = plug.power_alert_last_triggered
-        if last_triggered.tzinfo is None:
-            last_triggered = last_triggered.replace(tzinfo=timezone.utc)
-        time_since_last = datetime.now(timezone.utc) - last_triggered
+        # Naive UTC on both sides: the column is naive, so a row loaded fresh from
+        # the DB comes back without an offset and subtracting an aware now() would
+        # raise TypeError.
+        time_since_last = utcnow_naive() - to_naive_utc(plug.power_alert_last_triggered)
         if time_since_last < timedelta(minutes=cooldown_minutes):
             return
 
@@ -756,7 +851,7 @@ async def check_power_alerts(plug: SmartPlug, current_power: float | None, db: A
         threshold = plug.power_alert_low
 
     if alert_triggered:
-        plug.power_alert_last_triggered = datetime.now(timezone.utc)
+        plug.power_alert_last_triggered = utcnow_naive()
         await db.commit()
 
         # Send notification

@@ -2,13 +2,20 @@
  * Tests for the SettingsPage component.
  */
 
-import { describe, it, expect, beforeEach } from 'vitest';
-import { screen, waitFor } from '@testing-library/react';
+import { describe, it, expect, beforeEach, vi } from 'vitest';
+import { act, fireEvent, render as rtlRender, screen, waitFor, within } from '@testing-library/react';
 import userEvent from '@testing-library/user-event';
+import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
+import { BrowserRouter } from 'react-router-dom';
 import { render } from '../utils';
+import { ThemeProvider } from '../../contexts/ThemeContext';
+import { ToastProvider } from '../../contexts/ToastContext';
+import { AuthProvider } from '../../contexts/AuthContext';
 import { SettingsPage } from '../../pages/SettingsPage';
 import { http, HttpResponse } from 'msw';
 import { server } from '../mocks/server';
+import { SIDEBAR_HIDDEN_SYSTEM_ITEMS_KEY, SIDEBAR_ORDER_KEY } from '../../utils/sidebarLayout';
+import { setAuthToken } from '../../api/client';
 
 const mockSettings = {
   auto_archive: true,
@@ -20,6 +27,7 @@ const mockSettings = {
   ams_humidity_fair: 60,
   ams_temp_good: 30,
   ams_temp_fair: 35,
+  ams_temp_alarm: null,
   time_format: 'system',
   date_format: 'system',
   mqtt_enabled: false,
@@ -41,12 +49,18 @@ describe('SettingsPage', () => {
     // switch in one test (e.g. clicking "Workflow") doesn't carry into
     // sibling tests that expect to land on the default General tab.
     window.history.replaceState({}, '', '/');
+    vi.mocked(localStorage.getItem).mockReset();
+    vi.mocked(localStorage.setItem).mockReset();
+    vi.mocked(localStorage.removeItem).mockReset();
+    vi.mocked(localStorage.clear).mockReset();
+    localStorage.clear();
+    setAuthToken(null);
 
     server.use(
       http.get('/api/v1/settings/', () => {
         return HttpResponse.json(mockSettings);
       }),
-      http.patch('/api/v1/settings/', async ({ request }) => {
+      http.put('/api/v1/settings/', async ({ request }) => {
         const body = await request.json();
         return HttpResponse.json({ ...mockSettings, ...body });
       }),
@@ -70,6 +84,9 @@ describe('SettingsPage', () => {
       }),
       http.get('/api/v1/auth/status', () => {
         return HttpResponse.json({ auth_enabled: false, requires_setup: false });
+      }),
+      http.get('/api/v1/external-links/', () => {
+        return HttpResponse.json([]);
       })
     );
   });
@@ -99,6 +116,66 @@ describe('SettingsPage', () => {
     });
   });
 
+  describe('finish photo plate restore (#2547)', () => {
+    const restoreLabel = 'Restore plate for finish photo';
+
+    it('offers the toggle while finish photos are enabled', async () => {
+      render(<SettingsPage />);
+
+      expect(await screen.findByText(restoreLabel)).toBeInTheDocument();
+    });
+
+    it('hides the toggle when finish photos are switched off', async () => {
+      // It only describes how the finish photo is framed, so it is meaningless
+      // when no finish photo is taken at all.
+      server.use(
+        http.get('/api/v1/settings/', () =>
+          HttpResponse.json({ ...mockSettings, capture_finish_photo: false })
+        )
+      );
+      render(<SettingsPage />);
+
+      await screen.findByRole('heading', { name: 'Settings' });
+      await waitFor(() => {
+        expect(screen.queryByText(restoreLabel)).not.toBeInTheDocument();
+      });
+    });
+
+    it('defaults to on when the backend has never stored the setting', async () => {
+      // Existing installs have no row for it; the UI must not read that as off.
+      render(<SettingsPage />);
+
+      const label = await screen.findByText(restoreLabel);
+      const row = label.closest('div')!.parentElement!;
+      expect(within(row).getByRole('checkbox')).toBeChecked();
+    });
+
+    it('sends the new value on save', async () => {
+      let saved: Record<string, unknown> | null = null;
+      server.use(
+        http.put('/api/v1/settings/', async ({ request }) => {
+          saved = (await request.json()) as Record<string, unknown>;
+          return HttpResponse.json({ ...mockSettings, ...saved });
+        })
+      );
+      render(<SettingsPage />);
+
+      const label = await screen.findByText(restoreLabel);
+      // The page suppresses auto-save for 100ms after the settings load, so a
+      // click landing inside that window is swallowed with no re-trigger.
+      await new Promise((resolve) => setTimeout(resolve, 200));
+      const row = label.closest('div')!.parentElement!;
+      await userEvent.click(within(row).getByRole('checkbox'));
+
+      // The page auto-saves on a 500ms debounce, so the default 1s waitFor
+      // window is only just wide enough — give the request room to land.
+      await waitFor(() => {
+        expect(saved).not.toBeNull();
+      }, { timeout: 3000 });
+      expect(saved!.finish_photo_restore_plate).toBe(false);
+    });
+  });
+
   describe('general settings', () => {
     it('shows date format setting', async () => {
       render(<SettingsPage />);
@@ -114,6 +191,19 @@ describe('SettingsPage', () => {
       await waitFor(() => {
         expect(screen.getByText('Time Format')).toBeInTheDocument();
       });
+    });
+
+    it('no longer offers Camera View Mode, which moved to the printer card', async () => {
+      // The camera button on each printer card is a split control now, so the
+      // choice is made per stream rather than once for the whole install. The
+      // External Cameras section is still here, which is what keeps this from
+      // passing merely because the Camera card failed to render.
+      render(<SettingsPage />);
+
+      await waitFor(() => {
+        expect(screen.getByText('External Cameras')).toBeInTheDocument();
+      });
+      expect(screen.queryByText('Camera View Mode')).toBeNull();
     });
 
     it('shows default printer setting', async () => {
@@ -172,6 +262,246 @@ describe('SettingsPage', () => {
         expect(screen.getByText('Check printer firmware')).toBeInTheDocument();
       });
     });
+
+    it('hides a Bambuddy sidebar page from Sidebar', async () => {
+      const user = userEvent.setup();
+      render(<SettingsPage />);
+
+      await screen.findByRole('heading', { name: 'Sidebar' });
+      await screen.findAllByText('Visible in sidebar');
+
+      vi.mocked(localStorage.setItem).mockClear();
+      await user.click((await screen.findAllByLabelText('Hide page'))[0]);
+
+      expect(localStorage.setItem).toHaveBeenCalledWith(SIDEBAR_HIDDEN_SYSTEM_ITEMS_KEY, JSON.stringify(['printers']));
+      expect(screen.getByText('Hidden from sidebar')).toBeInTheDocument();
+    });
+
+    it('shows a previously hidden Bambuddy sidebar page from Sidebar', async () => {
+      vi.mocked(localStorage.getItem).mockImplementation((key) => {
+        if (key === SIDEBAR_HIDDEN_SYSTEM_ITEMS_KEY) return JSON.stringify(['printers']);
+        return null;
+      });
+
+      const user = userEvent.setup();
+      render(<SettingsPage />);
+
+      await screen.findByRole('heading', { name: 'Sidebar' });
+      await screen.findByText('Hidden from sidebar');
+
+      vi.mocked(localStorage.setItem).mockClear();
+      await user.click(await screen.findByLabelText('Show page'));
+
+      expect(localStorage.setItem).toHaveBeenCalledWith(SIDEBAR_HIDDEN_SYSTEM_ITEMS_KEY, JSON.stringify([]));
+      expect(screen.getAllByText('Visible in sidebar').length).toBeGreaterThan(0);
+    });
+
+    it('does not allow Settings to be hidden from Sidebar', async () => {
+      render(<SettingsPage />);
+
+      await screen.findByRole('heading', { name: 'Sidebar' });
+      await screen.findByText('Required in sidebar');
+
+      const settingsVisibilityButton = await screen.findByLabelText('Settings cannot be hidden');
+      expect(settingsVisibilityButton).toBeDisabled();
+      expect(screen.getByText('Required in sidebar')).toBeInTheDocument();
+    });
+
+    it('presents external links and Bambuddy pages in saved sidebar order', async () => {
+      vi.mocked(localStorage.getItem).mockImplementation((key) => {
+        if (key === SIDEBAR_ORDER_KEY) return JSON.stringify(['ext-7', 'printers', 'settings']);
+        return null;
+      });
+      server.use(
+        http.get('/api/v1/external-links/', () =>
+          HttpResponse.json([
+            {
+              id: 7,
+              name: 'Docs',
+              url: 'https://docs.example.test',
+              icon: 'Link',
+              open_in_new_tab: true,
+              custom_icon: null,
+              sort_order: 0,
+              created_at: '2026-01-01T00:00:00Z',
+              updated_at: '2026-01-01T00:00:00Z',
+            },
+          ]),
+        ),
+      );
+
+      render(<SettingsPage />);
+
+      await screen.findByRole('heading', { name: 'Sidebar' });
+      const docs = await screen.findByText('Docs');
+      const printers = screen.getAllByText('Printers').find(element => element.closest('[draggable="true"]'));
+
+      expect(printers).toBeDefined();
+      expect(docs.compareDocumentPosition(printers) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    });
+
+    it('saves mixed Sidebar order when items are dragged', async () => {
+      server.use(
+        http.get('/api/v1/external-links/', () =>
+          HttpResponse.json([
+            {
+              id: 7,
+              name: 'Docs',
+              url: 'https://docs.example.test',
+              icon: 'Link',
+              open_in_new_tab: true,
+              custom_icon: null,
+              sort_order: 0,
+              created_at: '2026-01-01T00:00:00Z',
+              updated_at: '2026-01-01T00:00:00Z',
+            },
+          ]),
+        ),
+      );
+
+      render(<SettingsPage />);
+
+      await screen.findByRole('heading', { name: 'Sidebar' });
+      const docsRow = (await screen.findByText('Docs')).closest('[draggable="true"]');
+      const printersRow = screen.getAllByText('Printers')
+        .find(element => element.closest('[draggable="true"]'))
+        ?.closest('[draggable="true"]');
+
+      expect(docsRow).not.toBeNull();
+      expect(printersRow).not.toBeNull();
+
+      vi.mocked(localStorage.setItem).mockClear();
+      const dataTransfer = {
+        effectAllowed: '',
+        dropEffect: '',
+        setData: vi.fn(),
+      };
+      fireEvent.dragStart(docsRow!, { dataTransfer });
+      fireEvent.dragOver(printersRow!, { dataTransfer });
+      fireEvent.drop(printersRow!, { dataTransfer });
+
+      expect(localStorage.setItem).toHaveBeenCalledWith(
+        SIDEBAR_ORDER_KEY,
+        JSON.stringify(['ext-7', 'printers', 'inventory', 'archives', 'queue', 'projects', 'files', 'makerworld', 'profiles', 'maintenance', 'stats', 'finance', 'notifications', 'settings']),
+      );
+    });
+
+    it('resets Sidebar to all pages first and configured links at the bottom', async () => {
+      vi.mocked(localStorage.getItem).mockImplementation((key) => {
+        if (key === SIDEBAR_HIDDEN_SYSTEM_ITEMS_KEY) return JSON.stringify(['printers', 'stats']);
+        if (key === SIDEBAR_ORDER_KEY) return JSON.stringify(['ext-7', 'settings', 'printers']);
+        return null;
+      });
+      server.use(
+        http.get('/api/v1/external-links/', () =>
+          HttpResponse.json([
+            {
+              id: 7,
+              name: 'Docs',
+              url: 'https://docs.example.test',
+              icon: 'Link',
+              open_in_new_tab: true,
+              custom_icon: null,
+              sort_order: 0,
+              created_at: '2026-01-01T00:00:00Z',
+              updated_at: '2026-01-01T00:00:00Z',
+            },
+          ]),
+        ),
+      );
+
+      const user = userEvent.setup();
+      render(<SettingsPage />);
+
+      const heading = await screen.findByRole('heading', { name: 'Sidebar' });
+      const card = heading.closest('#card-sidebar-links');
+      expect(card).not.toBeNull();
+      await screen.findByText('Docs');
+
+      vi.mocked(localStorage.setItem).mockClear();
+      await user.click(within(card as HTMLElement).getByRole('button', { name: /reset/i }));
+
+      expect(localStorage.setItem).toHaveBeenCalledWith(SIDEBAR_HIDDEN_SYSTEM_ITEMS_KEY, JSON.stringify([]));
+      expect(localStorage.setItem).toHaveBeenCalledWith(
+        SIDEBAR_ORDER_KEY,
+        JSON.stringify(['printers', 'inventory', 'archives', 'queue', 'projects', 'files', 'makerworld', 'profiles', 'maintenance', 'stats', 'finance', 'notifications', 'settings', 'ext-7']),
+      );
+
+      const settingsRow = screen.getAllByText('Settings')
+        .find(element => element.closest('[draggable="true"]'))
+        ?.closest('[draggable="true"]');
+      const docsRow = screen.getByText('Docs').closest('[draggable="true"]');
+      expect(settingsRow).not.toBeNull();
+      expect(docsRow).not.toBeNull();
+      expect(settingsRow!.compareDocumentPosition(docsRow!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+      expect(screen.queryByText('Hidden from sidebar')).not.toBeInTheDocument();
+    });
+
+    it('sets the current Sidebar order as the backend default for settings admins', async () => {
+      let defaultSidebarOrderPayload: string | null = null;
+      vi.mocked(localStorage.getItem).mockImplementation((key) => {
+        if (key === SIDEBAR_HIDDEN_SYSTEM_ITEMS_KEY) return JSON.stringify(['stats']);
+        return null;
+      });
+
+      server.use(
+        http.get('/api/v1/auth/status', () =>
+          HttpResponse.json({ auth_enabled: true, requires_setup: false }),
+        ),
+        http.get('/api/v1/auth/me', () =>
+          HttpResponse.json({
+            id: 1,
+            username: 'admin',
+            role: 'admin',
+            is_active: true,
+            is_admin: false,
+            groups: [{ id: 1, name: 'Administrators' }],
+            permissions: ['settings:update'],
+            created_at: '2026-01-01T00:00:00Z',
+          }),
+        ),
+        http.get('/api/v1/settings/', () =>
+          HttpResponse.json({ ...mockSettings, default_sidebar_order: '' }),
+        ),
+        http.put('/api/v1/settings/', async ({ request }) => {
+          const body = await request.json() as { default_sidebar_order?: string };
+          defaultSidebarOrderPayload = body.default_sidebar_order ?? null;
+          return HttpResponse.json({ ...mockSettings, ...body });
+        }),
+      );
+      setAuthToken('test-token');
+
+      const user = userEvent.setup();
+      render(<SettingsPage />);
+
+      const heading = await screen.findByRole('heading', { name: 'Sidebar' });
+      const card = heading.closest('#card-sidebar-links');
+      expect(card).not.toBeNull();
+
+      await user.click(within(card as HTMLElement).getByRole('switch', { name: 'Set Default' }));
+
+      await waitFor(() => {
+        expect(defaultSidebarOrderPayload).not.toBeNull();
+      });
+      expect(JSON.parse(defaultSidebarOrderPayload!)).toEqual({
+        order: [
+          'printers',
+          'inventory',
+          'archives',
+          'queue',
+          'projects',
+          'files',
+          'makerworld',
+          'profiles',
+          'maintenance',
+          'stats',
+          'finance',
+          'notifications',
+          'settings',
+        ],
+        hiddenSystemItemIds: ['stats'],
+      });
+    });
   });
 
   describe('update CTA per deployment shape', () => {
@@ -182,10 +512,11 @@ describe('SettingsPage', () => {
     // users never see the in-app Install button (which would no-op).
     const renderWithUpdateCheck = async (
       checkBody: Record<string, unknown>,
+      settingsOverrides: Record<string, unknown> = {},
     ) => {
       server.use(
         http.get('/api/v1/settings/', () =>
-          HttpResponse.json({ ...mockSettings, check_updates: true }),
+          HttpResponse.json({ ...mockSettings, check_updates: true, ...settingsOverrides }),
         ),
         http.get('/api/v1/updates/check', () => HttpResponse.json(checkBody)),
       );
@@ -238,6 +569,109 @@ describe('SettingsPage', () => {
       });
       expect(screen.queryByText(/Home Assistant Supervisor/i)).not.toBeInTheDocument();
       expect(screen.queryByRole('button', { name: /install update/i })).not.toBeInTheDocument();
+    });
+
+    // #2664: the bare command only works if the user is already standing in
+    // the directory holding their compose file, which is exactly the thing
+    // they came to the page not knowing.
+    const DOCKER_CHECK = {
+      update_available: true,
+      current_version: '0.2.4',
+      latest_version: '0.2.5',
+      release_name: '0.2.5',
+      release_notes: '',
+      release_url: 'https://example.invalid/r',
+      published_at: '2099-01-01T00:00:00Z',
+      is_docker: true,
+      is_ha_addon: false,
+      update_method: 'docker',
+    };
+
+    it('prefixes the command with cd when the backend detected a compose directory', async () => {
+      await renderWithUpdateCheck({ ...DOCKER_CHECK, compose_dir_detected: '/opt/bambuddy' });
+
+      await waitFor(() => {
+        expect(
+          screen.getByText('cd /opt/bambuddy && docker compose pull && docker compose up -d'),
+        ).toBeInTheDocument();
+      });
+    });
+
+    it('prefers the saved directory over the detected one', async () => {
+      await renderWithUpdateCheck(
+        { ...DOCKER_CHECK, compose_dir_detected: '/opt/guessed' },
+        { docker_compose_dir: '/srv/stacks/bambuddy' },
+      );
+
+      await waitFor(() => {
+        expect(
+          screen.getByText('cd /srv/stacks/bambuddy && docker compose pull && docker compose up -d'),
+        ).toBeInTheDocument();
+      });
+      expect(screen.queryByText(/\/opt\/guessed/)).not.toBeInTheDocument();
+    });
+
+    it('quotes a directory containing a space so the cd does not split', async () => {
+      await renderWithUpdateCheck(DOCKER_CHECK, { docker_compose_dir: '/srv/bambu buddy' });
+
+      await waitFor(() => {
+        expect(
+          screen.getByText('cd "/srv/bambu buddy" && docker compose pull && docker compose up -d'),
+        ).toBeInTheDocument();
+      });
+    });
+
+    it('copies the full command including the cd', async () => {
+      const writeText = vi.fn().mockResolvedValue(undefined);
+      Object.defineProperty(navigator, 'clipboard', { value: { writeText }, configurable: true });
+      Object.defineProperty(window, 'isSecureContext', { value: true, configurable: true });
+
+      await renderWithUpdateCheck({ ...DOCKER_CHECK, compose_dir_detected: '/opt/bambuddy' });
+
+      const copy = await screen.findByRole('button', { name: /copy update command/i });
+      await userEvent.click(copy);
+
+      expect(writeText).toHaveBeenCalledWith(
+        'cd /opt/bambuddy && docker compose pull && docker compose up -d',
+      );
+    });
+
+    it('offers an editable compose directory field seeded with the detected path', async () => {
+      await renderWithUpdateCheck({ ...DOCKER_CHECK, compose_dir_detected: '/opt/bambuddy' });
+
+      const field = await screen.findByPlaceholderText('/opt/bambuddy');
+      // Placeholder, not value — the detected path is a guess the user has
+      // not accepted, so saving must not silently adopt it.
+      expect(field).toHaveValue('');
+    });
+
+    it('shows the installer-download link for Windows installer installs', async () => {
+      const downloadUrl =
+        'https://github.com/maziggy/bambuddy/releases/download/v0.2.5/bambuddy-0.2.5-windows-x64-setup.exe';
+      await renderWithUpdateCheck({
+        update_available: true,
+        current_version: '0.2.4',
+        latest_version: '0.2.5',
+        release_name: '0.2.5',
+        release_notes: '',
+        release_url: 'https://github.com/maziggy/bambuddy/releases/tag/v0.2.5',
+        published_at: '2099-01-01T00:00:00Z',
+        is_docker: false,
+        is_ha_addon: false,
+        is_windows_installer: true,
+        update_method: 'windows_installer',
+        installer_download_url: downloadUrl,
+      });
+
+      const link = await screen.findByRole('link', { name: /download installer for v0\.2\.5/i });
+      expect(link).toHaveAttribute('href', downloadUrl);
+      expect(link).toHaveAttribute('target', '_blank');
+      expect(link).toHaveAttribute('rel', expect.stringContaining('noopener'));
+      // The in-app update button must NOT render — the git-fetch path can't
+      // work from an installer payload.
+      expect(screen.queryByRole('button', { name: /install update/i })).not.toBeInTheDocument();
+      expect(screen.queryByText(/Home Assistant Supervisor/i)).not.toBeInTheDocument();
+      expect(screen.queryByText('docker compose pull && docker compose up -d')).not.toBeInTheDocument();
     });
   });
 
@@ -306,6 +740,126 @@ describe('SettingsPage', () => {
         expect(screen.getByText('AMS Display Thresholds')).toBeInTheDocument();
       });
     });
+
+    // #2770: an AMS reads 15-20% while its own heater runs, so a drying
+    // threshold set below that can never be met and auto-drying ends one
+    // cycle only to arm the next. The default of 60 must stay quiet.
+    const openFilamentTab = async (humidityFair: number) => {
+      server.use(
+        http.get('/api/v1/settings/', () =>
+          HttpResponse.json({ ...mockSettings, ams_humidity_fair: humidityFair })
+        )
+      );
+      const user = userEvent.setup();
+      render(<SettingsPage />);
+      await waitFor(() => {
+        expect(screen.getAllByText('Filament').length).toBeGreaterThan(0);
+      });
+      await user.click(screen.getAllByText('Filament')[0]);
+      await waitFor(() => {
+        expect(screen.getByText('AMS Display Thresholds')).toBeInTheDocument();
+      });
+    };
+
+    it('warns when the humidity threshold is below what a drying AMS reports', async () => {
+      await openFilamentTab(14);
+
+      expect(await screen.findByText(/Auto-drying cannot reach this value/)).toBeInTheDocument();
+    });
+
+    it('stays quiet for a humidity threshold auto-drying can actually reach', async () => {
+      await openFilamentTab(60);
+
+      expect(screen.queryByText(/Auto-drying cannot reach this value/)).not.toBeInTheDocument();
+    });
+
+    // #2905: the alarm threshold is a separate value from the Fair display
+    // band, and unset means "use Fair" rather than "never alarm". Everything
+    // below turns on telling those two apart.
+    const openFilamentTabWith = async (overrides: Record<string, unknown>) => {
+      server.use(
+        http.get('/api/v1/settings/', () => HttpResponse.json({ ...mockSettings, ...overrides }))
+      );
+      const user = userEvent.setup();
+      render(<SettingsPage />);
+      await waitFor(() => {
+        expect(screen.getAllByText('Filament').length).toBeGreaterThan(0);
+      });
+      await user.click(screen.getAllByText('Filament')[0]);
+      await waitFor(() => {
+        expect(screen.getByText('AMS Display Thresholds')).toBeInTheDocument();
+      });
+    };
+
+    const alarmInput = () =>
+      within(screen.getByText('Alarm above').parentElement!).getByRole('spinbutton');
+
+    it('shows the fair threshold as the placeholder while the alarm threshold is unset', async () => {
+      // The fallback has to be visible in the field itself. Blank with no hint
+      // reads as "no alarm", which is the opposite of what unset does.
+      await openFilamentTabWith({ ams_temp_fair: 38, ams_temp_alarm: null });
+
+      const input = alarmInput();
+      expect(input).toHaveValue(null);
+      expect(input).toHaveAttribute('placeholder', '38');
+    });
+
+    it('sends the typed alarm threshold on save', async () => {
+      let saved: Record<string, unknown> | null = null;
+      server.use(
+        http.put('/api/v1/settings/', async ({ request }) => {
+          saved = (await request.json()) as Record<string, unknown>;
+          return HttpResponse.json({ ...mockSettings, ...saved });
+        })
+      );
+      await openFilamentTabWith({ ams_temp_alarm: null });
+      // The page suppresses auto-save for 100ms after the settings load.
+      await new Promise((resolve) => setTimeout(resolve, 200));
+
+      await userEvent.type(alarmInput(), '45');
+
+      // Assert on the value rather than merely on a save having happened: two
+      // keystrokes can straddle the 500ms debounce on a slow runner, and the
+      // first save would then carry 4. Waiting for 45 rides that out.
+      await waitFor(() => {
+        expect(saved?.ams_temp_alarm).toBe(45);
+      }, { timeout: 3000 });
+    });
+
+    it('sends null when the alarm threshold is cleared', async () => {
+      // The one path the backend tests cannot reach on their own: clearing has
+      // to send an explicit null, not omit the key, or the old threshold stays.
+      let saved: Record<string, unknown> | null = null;
+      server.use(
+        http.put('/api/v1/settings/', async ({ request }) => {
+          saved = (await request.json()) as Record<string, unknown>;
+          return HttpResponse.json({ ...mockSettings, ...saved });
+        })
+      );
+      await openFilamentTabWith({ ams_temp_alarm: 45 });
+      await new Promise((resolve) => setTimeout(resolve, 200));
+
+      await userEvent.clear(alarmInput());
+
+      await waitFor(() => {
+        expect(saved).not.toBeNull();
+        expect(saved!.ams_temp_alarm).toBeNull();
+      }, { timeout: 3000 });
+    });
+
+    it('warns that a non-positive alarm threshold is ignored', async () => {
+      // The backend refuses <= 0 and falls back to Fair. Saying so beats a min=
+      // attribute the browser only enforces on submit.
+      await openFilamentTabWith({ ams_temp_alarm: 0 });
+
+      expect(await screen.findByText(/A threshold of 0 or less is ignored/)).toBeInTheDocument();
+    });
+
+    it('stays quiet for an alarm threshold the backend will honour', async () => {
+      await openFilamentTabWith({ ams_temp_alarm: 45 });
+
+      expect(screen.queryByText(/A threshold of 0 or less is ignored/)).not.toBeInTheDocument();
+    });
   });
 
   describe('Workflow tab', () => {
@@ -353,6 +907,29 @@ describe('SettingsPage', () => {
 
       await waitFor(() => {
         expect(screen.getByText('Queue Auto-Drying')).toBeInTheDocument();
+      });
+    });
+
+    it('shows per-filament humidity threshold editor on Workflow tab (#1605)', async () => {
+      const user = userEvent.setup();
+      render(<SettingsPage />);
+
+      await waitFor(() => {
+        expect(screen.getByText('Workflow')).toBeInTheDocument();
+      });
+
+      await user.click(screen.getByText('Workflow'));
+
+      await waitFor(() => {
+        expect(screen.getByText('Humidity Thresholds')).toBeInTheDocument();
+        // Default row is unique to the humidity editor (drying presets has no
+        // default row), so we can pin it without disambiguating from the
+        // adjacent drying-presets table that also lists PLA/ASA/etc.
+        expect(screen.getByText('Default (unknown types)')).toBeInTheDocument();
+        // Filament rows render in both tables — assert by count instead of
+        // a single getByText. 8 default filaments × 2 tables = 16 PLAs etc.
+        expect(screen.getAllByText('PLA').length).toBeGreaterThanOrEqual(2);
+        expect(screen.getAllByText('ASA').length).toBeGreaterThanOrEqual(2);
       });
     });
 
@@ -926,5 +1503,539 @@ describe('SettingsPage', () => {
       // mode on PR #1263).
       15_000,
     );
+  });
+
+  describe('theme mode buttons', () => {
+    it('renders Dark, Light, and System buttons', async () => {
+      render(<SettingsPage />);
+
+      await waitFor(() => {
+        expect(screen.getByRole('button', { name: 'Dark' })).toBeInTheDocument();
+        expect(screen.getByRole('button', { name: 'Light' })).toBeInTheDocument();
+        expect(screen.getByRole('button', { name: 'System' })).toBeInTheDocument();
+      });
+    });
+
+    it('highlights the active mode button with green border', async () => {
+      render(<SettingsPage />);
+      const user = userEvent.setup();
+
+      await waitFor(() => {
+        expect(screen.getByRole('button', { name: 'System' })).toBeInTheDocument();
+      });
+
+      await user.click(screen.getByRole('button', { name: 'System' }));
+
+      await waitFor(() => {
+        const systemBtn = screen.getByRole('button', { name: 'System' });
+        expect(systemBtn.className).toContain('border-bambu-green');
+      });
+    });
+
+    it('clicking a theme button switches mode', async () => {
+      localStorage.setItem('theme-mode', 'dark');
+      render(<SettingsPage />);
+      const user = userEvent.setup();
+
+      await waitFor(() => {
+        const darkBtn = screen.getByRole('button', { name: 'Dark' });
+        expect(darkBtn.className).toContain('border-bambu-green');
+      });
+
+      const lightBtn = screen.getByRole('button', { name: 'Light' });
+      await user.click(lightBtn);
+
+      await waitFor(() => {
+        expect(lightBtn.className).toContain('border-bambu-green');
+      });
+    });
+
+    it('shows a toast when theme button is clicked', async () => {
+      render(<SettingsPage />);
+      const user = userEvent.setup();
+
+      await waitFor(() => {
+        expect(screen.getByRole('button', { name: 'System' })).toBeInTheDocument();
+      });
+
+      await user.click(screen.getByRole('button', { name: 'System' }));
+
+      await waitFor(() => {
+        expect(screen.getByText('Settings saved')).toBeInTheDocument();
+      });
+    });
+  });
+
+  // --------------------------------------------------------------------
+  // Slicer Pipelines (#1425) — Workflow tab sub-tabs
+  // --------------------------------------------------------------------
+  describe('workflow sub-tabs (#1425)', () => {
+    beforeEach(() => {
+      // Endpoints the Pipelines panel calls (#1425).
+      server.use(
+        http.get('/api/v1/slicer-pipelines/', () => HttpResponse.json({ pipelines: [] })),
+        http.get('/api/v1/slicer/presets', () =>
+          HttpResponse.json({
+            orca_cloud: { printer: [], process: [], filament: [] },
+            cloud: { printer: [], process: [], filament: [] },
+            local: { printer: [], process: [], filament: [] },
+            standard: { printer: [], process: [], filament: [] },
+            cloud_status: 'ok',
+            orca_cloud_status: 'ok',
+          }),
+        ),
+      );
+    });
+
+    it('renders Queue & Dispatch + Pipelines sub-tabs under Workflow', async () => {
+      render(<SettingsPage />);
+      const user = userEvent.setup();
+      await waitFor(() => {
+        // Workflow tab in the sidebar — exact match to avoid colliding with
+        // "Print Queue" or "Queue Settings" labels elsewhere on the page.
+        expect(screen.getByRole('button', { name: 'Workflow' })).toBeInTheDocument();
+      });
+      await user.click(screen.getByRole('button', { name: 'Workflow' }));
+      await waitFor(() => {
+        expect(screen.getByRole('button', { name: /Queue & Dispatch/i })).toBeInTheDocument();
+        expect(screen.getByRole('button', { name: /^Pipelines$/i })).toBeInTheDocument();
+      });
+    });
+
+    it('clicking Pipelines sub-tab shows the empty-state hint and updates the URL', async () => {
+      render(<SettingsPage />);
+      const user = userEvent.setup();
+      await waitFor(() => expect(screen.getByRole('button', { name: 'Workflow' })).toBeInTheDocument());
+      await user.click(screen.getByRole('button', { name: 'Workflow' }));
+      await user.click(screen.getByRole('button', { name: /^Pipelines$/i }));
+
+      await waitFor(() => {
+        expect(screen.getByText(/No pipelines yet/i)).toBeInTheDocument();
+        // Deep-link URL carries both ?tab=queue and ?sub=pipelines
+        expect(window.location.search).toContain('tab=queue');
+        expect(window.location.search).toContain('sub=pipelines');
+      });
+    });
+  });
+});
+
+/**
+ * Location sensor cards on Settings -> Sensors read the live readings
+ * endpoint (reachable-aware) rather than the sensor row's last_state, so an
+ * entity Home Assistant has stopped reporting shows "Unavailable" instead of
+ * silently keeping its last colorized value on screen forever.
+ */
+describe('SettingsPage — location sensor reachability', () => {
+  beforeEach(() => {
+    window.history.replaceState({}, '', '/');
+  });
+
+  const locationSensor = {
+    id: 1,
+    location_id: 7,
+    name: 'Drybox 1 Temperature',
+    entity_id: 'sensor.drybox_1_temperature',
+    kind: 'numeric',
+    device_class: 'temperature',
+    unit: '°C',
+    alert_state: null,
+    alert_above: 30,
+    alert_below: 20,
+    notify_on_alert: false,
+    show_on_card: true,
+    sort_order: 0,
+    last_state: '65.0',
+    last_changed: null,
+    last_checked: null,
+    created_at: '',
+    updated_at: '',
+  };
+
+  it('shows "Unavailable" for an unreachable sensor instead of its stale last value', async () => {
+    server.use(
+      http.get('/api/v1/location-ha-sensors/', () => HttpResponse.json([locationSensor])),
+      http.get('/api/v1/location-ha-sensors/by-location/7/readings', () =>
+        HttpResponse.json([
+          {
+            id: 1,
+            name: 'Drybox 1 Temperature',
+            entity_id: 'sensor.drybox_1_temperature',
+            kind: 'numeric',
+            device_class: 'temperature',
+            unit: '°C',
+            state: null,
+            value: null,
+            alerting: false,
+            reachable: false,
+            alert_state: null,
+            alert_above: 30,
+            alert_below: 20,
+            last_changed: null,
+          },
+        ])
+      ),
+      http.get('/api/v1/inventory/locations', () =>
+        HttpResponse.json([{ id: 7, name: 'Drybox 1', identifier: null, spool_count: 0, created_at: '', updated_at: '' }])
+      )
+    );
+
+    const user = userEvent.setup();
+    render(<SettingsPage />);
+
+    await user.click(await screen.findByText('Sensors'));
+    await screen.findByText('sensor.drybox_1_temperature');
+
+    expect(await screen.findByText('Unavailable')).toBeInTheDocument();
+    expect(screen.queryByText('65.00 °C')).not.toBeInTheDocument();
+  });
+
+  it('shows the live value, not last_state, when the sensor is reachable', async () => {
+    server.use(
+      http.get('/api/v1/location-ha-sensors/', () => HttpResponse.json([locationSensor])),
+      http.get('/api/v1/location-ha-sensors/by-location/7/readings', () =>
+        HttpResponse.json([
+          {
+            id: 1,
+            name: 'Drybox 1 Temperature',
+            entity_id: 'sensor.drybox_1_temperature',
+            kind: 'numeric',
+            device_class: 'temperature',
+            unit: '°C',
+            state: '24.5',
+            value: 24.5,
+            alerting: false,
+            reachable: true,
+            alert_state: null,
+            alert_above: 30,
+            alert_below: 20,
+            last_changed: null,
+          },
+        ])
+      ),
+      http.get('/api/v1/inventory/locations', () =>
+        HttpResponse.json([{ id: 7, name: 'Drybox 1', identifier: null, spool_count: 0, created_at: '', updated_at: '' }])
+      )
+    );
+
+    const user = userEvent.setup();
+    render(<SettingsPage />);
+
+    await user.click(await screen.findByText('Sensors'));
+    await screen.findByText('sensor.drybox_1_temperature');
+
+    expect(await screen.findByText('24.50 °C')).toBeInTheDocument();
+    expect(screen.queryByText('Unavailable')).not.toBeInTheDocument();
+  });
+
+  it('shows the entity id in the overview row, with the display name as its hover title', async () => {
+    server.use(
+      http.get('/api/v1/location-ha-sensors/', () => HttpResponse.json([locationSensor])),
+      http.get('/api/v1/location-ha-sensors/by-location/7/readings', () => HttpResponse.json([])),
+      http.get('/api/v1/inventory/locations', () =>
+        HttpResponse.json([{ id: 7, name: 'Drybox 1', identifier: null, spool_count: 0, created_at: '', updated_at: '' }])
+      )
+    );
+
+    const user = userEvent.setup();
+    render(<SettingsPage />);
+
+    await user.click(await screen.findByText('Sensors'));
+
+    const entityIdText = await screen.findByText('sensor.drybox_1_temperature');
+    expect(entityIdText).toHaveAttribute('title', 'Drybox 1 Temperature');
+    expect(screen.queryByText('Drybox 1 Temperature')).not.toBeInTheDocument();
+  });
+
+  it('refreshes the sensor list even when a bulk delete partially fails', async () => {
+    let sensors = [
+      { ...locationSensor, id: 1, name: 'Drybox 1 Temperature' },
+      {
+        ...locationSensor,
+        id: 2,
+        name: 'Drybox 1 Humidity',
+        entity_id: 'sensor.drybox_1_humidity',
+        device_class: 'humidity',
+        unit: '%',
+      },
+    ];
+
+    server.use(
+      http.get('/api/v1/location-ha-sensors/', () => HttpResponse.json(sensors)),
+      http.get('/api/v1/location-ha-sensors/by-location/7/readings', () => HttpResponse.json([])),
+      http.get('/api/v1/inventory/locations', () =>
+        HttpResponse.json([{ id: 7, name: 'Drybox 1', identifier: null, spool_count: 0, created_at: '', updated_at: '' }])
+      ),
+      // The first delete succeeds and actually removes the row; the second
+      // fails, simulating a partial failure partway through the sequential
+      // delete loop.
+      http.delete('/api/v1/location-ha-sensors/1', () => {
+        sensors = sensors.filter((s) => s.id !== 1);
+        return HttpResponse.json({ message: 'Sensor removed' });
+      }),
+      http.delete('/api/v1/location-ha-sensors/2', () => new HttpResponse(null, { status: 500 }))
+    );
+
+    const user = userEvent.setup();
+    render(<SettingsPage />);
+
+    await user.click(await screen.findByText('Sensors'));
+    await screen.findByText('sensor.drybox_1_temperature');
+    await screen.findByText('sensor.drybox_1_humidity');
+
+    await user.click(screen.getByRole('button', { name: 'Delete' }));
+    await user.click(await screen.findByRole('button', { name: 'Confirm' }));
+
+    // The sensor that actually got deleted on the backend must not linger on
+    // screen just because the batch as a whole reported an error.
+    await waitFor(() => expect(screen.queryByText('sensor.drybox_1_temperature')).not.toBeInTheDocument());
+    expect(screen.getByText('sensor.drybox_1_humidity')).toBeInTheDocument();
+  });
+
+  it('orders location cards by location, not by the order their sensors were created', async () => {
+    // Sensor for location 8 ("Drybox 10") appears in the array before the
+    // sensor for location 7 ("Drybox 2") — a naive Map-insertion-order
+    // render would put "Drybox 10" first. Card order must follow the
+    // (naturally sorted) locations list instead.
+    const sensors = [
+      {
+        id: 1,
+        location_id: 8,
+        name: 'Drybox 10 Temperature',
+        entity_id: 'sensor.drybox_10_temperature',
+        device_class: 'temperature',
+        unit: '°C',
+      },
+      {
+        id: 2,
+        location_id: 7,
+        name: 'Drybox 2 Temperature',
+        entity_id: 'sensor.drybox_2_temperature',
+        device_class: 'temperature',
+        unit: '°C',
+      },
+    ];
+
+    server.use(
+      http.get('/api/v1/location-ha-sensors/', () => HttpResponse.json(sensors)),
+      http.get('/api/v1/location-ha-sensors/by-location/7/readings', () => HttpResponse.json([])),
+      http.get('/api/v1/location-ha-sensors/by-location/8/readings', () => HttpResponse.json([])),
+      http.get('/api/v1/inventory/locations', () =>
+        HttpResponse.json([
+          { id: 7, name: 'Drybox 2', identifier: null, spool_count: 0, created_at: '', updated_at: '' },
+          { id: 8, name: 'Drybox 10', identifier: null, spool_count: 0, created_at: '', updated_at: '' },
+        ])
+      )
+    );
+
+    const user = userEvent.setup();
+    const { container } = render(<SettingsPage />);
+
+    await user.click(await screen.findByText('Sensors'));
+    await screen.findByText('sensor.drybox_10_temperature');
+
+    const cardTitles = Array.from(container.querySelectorAll('.text-white.font-medium.truncate')).map(
+      (el) => el.textContent
+    );
+    const drybox2Index = cardTitles.indexOf('Drybox 2');
+    const drybox10Index = cardTitles.indexOf('Drybox 10');
+    expect(drybox2Index).toBeGreaterThanOrEqual(0);
+    expect(drybox10Index).toBeGreaterThanOrEqual(0);
+    expect(drybox2Index).toBeLessThan(drybox10Index);
+  });
+});
+
+/**
+ * Sponsor banner on Settings -> General.
+ *
+ * Below the fleet threshold it makes the community/donation ask; at or above it
+ * the same slot makes the commercial ask and points at business.html. A print
+ * farm asked to chip in $5 is a wasted impression, and a hobbyist pitched a
+ * support contract is an annoyed user — so both directions are pinned.
+ */
+describe('SettingsPage — sponsor banner audience', () => {
+  beforeEach(() => {
+    // BrowserRouter shares window.location across tests and the banner only
+    // renders on the General tab — without this reset a prior test's ?tab=queue
+    // leaks in and the banner never mounts.
+    window.history.replaceState({}, '', '/');
+  });
+
+  const fleet = (count: number) =>
+    server.use(
+      http.get('/api/v1/printers/', () =>
+        HttpResponse.json(
+          Array.from({ length: count }, (_, i) => ({
+            id: i + 1,
+            name: `Printer ${i + 1}`,
+            serial_number: `SN${i + 1}`,
+            ip_address: '192.168.1.10',
+            model: 'X1C',
+            is_active: true,
+          })),
+        ),
+      ),
+    );
+
+  it('shows the community ask for a small fleet', async () => {
+    fleet(2);
+    render(<SettingsPage />);
+
+    const banner = await screen.findByRole('link', { name: /Independent & community-funded/i });
+    expect(banner).toHaveAttribute('href', 'https://bambuddy.cool/sponsors.html?from=app-settings');
+    expect(screen.queryByText(/Bambuddy for business/i)).not.toBeInTheDocument();
+  });
+
+  it('shows the commercial ask for a business-sized fleet', async () => {
+    fleet(6);
+    render(<SettingsPage />);
+
+    const banner = await screen.findByRole('link', { name: /Bambuddy for business/i });
+    expect(banner).toHaveAttribute('href', 'https://bambuddy.cool/business.html?from=app-settings');
+    // The donation copy is replaced, not merely supplemented.
+    expect(screen.queryByText(/Independent & community-funded/i)).not.toBeInTheDocument();
+    // The ask names the fleet back to them.
+    expect(screen.getByText(/6 printers/i)).toBeInTheDocument();
+  });
+});
+
+describe('SettingsPage — settings changed outside the page (#2716)', () => {
+  const restoreLabel = 'Restore plate for finish photo';
+  // external_url is deliberately populated: when the server has none the page
+  // detects one from the browser and saves it unprompted, which would show up
+  // as a PUT in tests that assert none was made. That behaviour has its own
+  // test at the end of this block.
+  const baseSettings = { ...mockSettings, external_url: window.location.origin };
+
+  let queryClient: QueryClient;
+  let puts: Record<string, unknown>[];
+  let served: Record<string, unknown>;
+
+  function renderPage() {
+    queryClient = new QueryClient({
+      defaultOptions: { queries: { retry: false, gcTime: 0 }, mutations: { retry: false } },
+    });
+    return rtlRender(
+      <QueryClientProvider client={queryClient}>
+        <BrowserRouter>
+          <AuthProvider>
+            <ThemeProvider>
+              <ToastProvider>
+                <SettingsPage />
+              </ToastProvider>
+            </ThemeProvider>
+          </AuthProvider>
+        </BrowserRouter>
+      </QueryClientProvider>
+    );
+  }
+
+  /** Change the settings row server-side and let the page's query observe it. */
+  async function changeOnServer(patch: Record<string, unknown>) {
+    served = { ...served, ...patch };
+    await act(async () => {
+      await queryClient.invalidateQueries({ queryKey: ['settings'] });
+    });
+  }
+
+  /** Wait out the 100ms initial-load suppression, then flip a checkbox. */
+  async function toggleRestorePlate() {
+    const label = await screen.findByText(restoreLabel);
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    const row = label.closest('div')!.parentElement!;
+    await userEvent.click(within(row).getByRole('checkbox'));
+  }
+
+  beforeEach(() => {
+    window.history.replaceState({}, '', '/');
+    localStorage.clear();
+    setAuthToken(null);
+    puts = [];
+    served = { ...baseSettings };
+
+    server.use(
+      http.get('/api/v1/settings/', () => HttpResponse.json(served)),
+      http.put('/api/v1/settings/', async ({ request }) => {
+        const body = (await request.json()) as Record<string, unknown>;
+        puts.push(body);
+        served = { ...served, ...body };
+        return HttpResponse.json(served);
+      })
+    );
+  });
+
+  it('does not write its stale copy back over a server-side change', async () => {
+    // The defect: the page diffed the live query cache against its own copy, so
+    // a refetch that carried someone else's change read as a local edit and was
+    // reverted ~500ms later with no user interaction at all.
+    renderPage();
+    await screen.findByText(restoreLabel);
+    await new Promise((resolve) => setTimeout(resolve, 200));
+
+    await changeOnServer({ currency: 'EUR' });
+
+    // Well past the 500ms debounce.
+    await new Promise((resolve) => setTimeout(resolve, 1200));
+    expect(puts).toEqual([]);
+  });
+
+  it('adopts the server value, so a later save carries it rather than the stale one', async () => {
+    renderPage();
+    await new Promise((resolve) => setTimeout(resolve, 200));
+    await changeOnServer({ currency: 'EUR' });
+
+    await toggleRestorePlate();
+
+    await waitFor(() => expect(puts).toHaveLength(1), { timeout: 3000 });
+    // The user's edit is saved...
+    expect(puts[0].finish_photo_restore_plate).toBe(false);
+    // ...and the field they never touched goes back as the server's value, not
+    // the USD the page loaded with.
+    expect(puts[0].currency).toBe('EUR');
+  });
+
+  it('never reverts a pending user edit that the server changed too', async () => {
+    renderPage();
+    await toggleRestorePlate();
+    // Lands while the edit is still sitting in the 500ms debounce, i.e. before
+    // the page has committed it. Adopting the server's value here would throw
+    // the edit away silently.
+    await changeOnServer({ finish_photo_restore_plate: true });
+
+    await waitFor(() => expect(puts.length).toBeGreaterThan(0), { timeout: 3000 });
+    await new Promise((resolve) => setTimeout(resolve, 1200));
+    // Asserted over every request rather than a particular one: whichever order
+    // the refetch and the debounce happen to land in, no write may carry the
+    // server's value back over the user's.
+    expect(puts.map((p) => p.finish_photo_restore_plate)).toEqual(puts.map(() => false));
+  });
+
+  it('saves once per edit — the baseline moves with the saved row', async () => {
+    // Guards the failure mode the baseline introduces if it is not advanced on
+    // save: every render would diff against the pre-save snapshot and re-send.
+    renderPage();
+    await toggleRestorePlate();
+
+    await waitFor(() => expect(puts).toHaveLength(1), { timeout: 3000 });
+    await new Promise((resolve) => setTimeout(resolve, 1500));
+    expect(puts).toHaveLength(1);
+  });
+
+  it('still persists the external_url it detects from the browser', async () => {
+    // The page seeds external_url from window.location.origin when the server
+    // has none and relies on the auto-save to persist it. That only works
+    // because the baseline is the raw server row: seed the baseline from the
+    // adjusted copy instead and the detected URL matches it, so nothing ever
+    // marks it as needing a save.
+    served = { ...mockSettings };
+    renderPage();
+    await screen.findByText(restoreLabel);
+    await new Promise((resolve) => setTimeout(resolve, 200));
+
+    // A refetch carrying a field this page does not manage. It is enough to
+    // re-run the diff, and the only thing that differs is the detected URL.
+    await changeOnServer({ spoolman_url: 'http://spoolman.example' });
+
+    await waitFor(() => expect(puts).toHaveLength(1), { timeout: 3000 });
+    expect(puts[0].external_url).toBe(window.location.origin);
   });
 });

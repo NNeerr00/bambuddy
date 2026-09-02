@@ -2,18 +2,42 @@ import { useQueryClient } from '@tanstack/react-query';
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { useToast } from '../contexts/ToastContext';
 import { useTranslation } from 'react-i18next';
+import { api, ApiError } from '../api/client';
+import { inventoryLocationsQueryKey } from '../utils/inventoryQueries';
+
+// The only auth-failure close code /api/v1/ws emits (websocket.py
+// _WS_CLOSE_UNAUTHORIZED). A 4401 means the ws-token was missing / invalid /
+// expired, or the caller lacks WEBSOCKET_CONNECT — none of which a reconnect can
+// fix without a fresh login (which remounts this provider anyway). Treat it as
+// terminal so we don't respawn the /auth/ws-token loop.
+const WS_CLOSE_UNAUTHORIZED = 4401;
 
 interface WebSocketMessage {
   type: string;
   printer_id?: number;
   data?: Record<string, unknown>;
   printer_name?: string;
+  filename?: string;
   missing_slots?: Array<{ slot?: string }>;
+  // Spool-assignment read-back verification (#2582).
+  slot?: string;
+  verified?: boolean;
+  kprofile_applied?: boolean;
+  saw_tray?: boolean;
+  // Slicer Pipeline run events (#1425 PR C). ``run`` carries the full
+  // PipelineRunResponse payload — typed loosely here so the WebSocket hook
+  // doesn't pull the full client.ts types in.
+  run?: { pipeline_id?: number | null };
 }
 
 export function useWebSocket() {
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimeoutRef = useRef<number | null>(null);
+  // Set true by the effect cleanup so a close event fired *during* unmount
+  // can't schedule a reconnect after the provider is gone (the old code cleared
+  // reconnectTimeoutRef, then .close() ran ws.onclose which set a *fresh*
+  // timeout — a leaked reconnect that kept minting ws-tokens post-logout).
+  const disposedRef = useRef(false);
   const queryClient = useQueryClient();
   const [isConnected, setIsConnected] = useState(false);
   const lastMissingSpoolWarningRef = useRef<Map<number, string>>(new Map());
@@ -46,16 +70,16 @@ export function useWebSocket() {
     const processNext = () => {
       const message = messageQueueRef.current.shift();
       if (message) {
-        // Use requestAnimationFrame to yield to the browser
-        requestAnimationFrame(() => {
-          handleMessageRef.current(message);
-          // Small delay between messages to prevent overwhelming the browser
-          if (messageQueueRef.current.length > 0) {
-            setTimeout(processNext, 16); // ~60fps
-          } else {
-            processingRef.current = false;
-          }
-        });
+        handleMessageRef.current(message);
+        // Small delay between messages to prevent overwhelming the browser.
+        // This setTimeout is the yield; a requestAnimationFrame around the
+        // handler used to sit here too, which stalled the whole queue in a
+        // hidden tab (see the note on the rAF removal below).
+        if (messageQueueRef.current.length > 0) {
+          setTimeout(processNext, 16); // ~60fps
+        } else {
+          processingRef.current = false;
+        }
       } else {
         processingRef.current = false;
       }
@@ -64,13 +88,49 @@ export function useWebSocket() {
     processNext();
   }, []);
 
-  const connect = useCallback(() => {
-    if (wsRef.current?.readyState === WebSocket.OPEN) {
+  const connect = useCallback(async () => {
+    if (disposedRef.current || wsRef.current?.readyState === WebSocket.OPEN) {
+      return;
+    }
+
+    // GHSA-r2qv follow-up: when auth is enabled, /ws now requires a token
+    // minted by POST /api/v1/auth/ws-token. We use the shared ``api.request``
+    // helper (via ``api.getWebSocketToken``) so the JWT Authorization header
+    // is attached — a raw ``fetch()`` with ``credentials: 'include'`` would
+    // miss it (Bambuddy uses Bearer tokens, not cookies, for JWT auth).
+    // Auth-disabled deployments accept connections without a token.
+    let token: string | undefined;
+    try {
+      const resp = await api.getWebSocketToken();
+      token = resp.token;
+    } catch (err) {
+      // A 401/403 from the token mint is an AUTH decision, not a transient
+      // blip, so retrying is pointless and hammers /auth/ws-token every 3s:
+      //   401 — the JWT expired. ``request()`` already cleared it and
+      //         dispatched ``auth:expired``, so the route guard is redirecting
+      //         to /login and this provider is about to unmount.
+      //   403 — the user is validly logged in but their group lacks
+      //         WEBSOCKET_CONNECT. They stay logged in; live updates simply
+      //         degrade to the REST polling the query cache already does.
+      // Either way: do NOT open a tokenless socket (the server just closes it
+      // 4401) and do NOT reconnect. The old catch-all fell through to a
+      // tokenless socket whose 4401 close rescheduled connect() forever. A
+      // network/5xx error is not auth — fall through and let the socket + its
+      // reconnect loop handle it (auth-disabled deployments also land here with
+      // no token and connect fine).
+      const status = err instanceof ApiError ? err.status : 0;
+      if (status === 401 || status === 403) {
+        return;
+      }
+    }
+
+    if (disposedRef.current) {
       return;
     }
 
     const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsUrl = `${protocol}//${window.location.host}/api/v1/ws`;
+    const tokenParam = token ? `?token=${encodeURIComponent(token)}` : '';
+    const wsUrl = `${protocol}//${window.location.host}/api/v1/ws${tokenParam}`;
 
     const ws = new WebSocket(wsUrl);
 
@@ -113,6 +173,14 @@ export function useWebSocket() {
       setIsConnected(false);
       wsRef.current = null;
 
+      // Don't reconnect after an auth rejection (4401) or once the provider has
+      // unmounted — both would just respawn the /auth/ws-token loop. A 4401 is
+      // terminal (needs a fresh login, which remounts us); every other close
+      // code is treated as a network drop and gets the 3s reconnect.
+      if (disposedRef.current || event.code === WS_CLOSE_UNAUTHORIZED) {
+        return;
+      }
+
       // Reconnect after 3 seconds
       reconnectTimeoutRef.current = window.setTimeout(() => {
         connect();
@@ -127,37 +195,69 @@ export function useWebSocket() {
     wsRef.current = ws;
   }, [processMessageQueue]);
 
-  // Throttled printer status update - coalesces rapid updates per printer
+  // Write every pending printer status into the query cache.
+  //
+  // Extracted so the hidden-tab path below can run it inline: both paths share
+  // this one body, so the merge semantics cannot drift apart. Cancels any
+  // scheduled coalescing timer, since everything it was going to write has
+  // just been written and re-running it would re-apply stale data over newer.
+  const flushPrinterStatus = useCallback(() => {
+    if (printerStatusTimeoutRef.current) {
+      clearTimeout(printerStatusTimeoutRef.current);
+      printerStatusTimeoutRef.current = null;
+    }
+
+    const updates = new Map(pendingPrinterStatus.current);
+    pendingPrinterStatus.current.clear();
+
+    updates.forEach((statusData, id) => {
+      queryClient.setQueryData(['printerStatus', id], (old: Record<string, unknown> | undefined) => {
+        const merged = { ...old, ...statusData };
+        if (merged.wifi_signal == null && old?.wifi_signal != null) {
+          merged.wifi_signal = old.wifi_signal;
+        }
+        return merged;
+      });
+    });
+  }, [queryClient]);
+
+  // Printer status update — coalesced while the tab is visible, written
+  // straight through while it is not.
+  //
+  // #2754 (reporter @mic4rd), in two stages. First, these writes ran inside a
+  // requestAnimationFrame: a hidden tab gets no rendering opportunities, so
+  // the browser *holds* queued frame callbacks rather than throttling them,
+  // and nothing reached the cache until the tab was shown again. Removing the
+  // frame callback fixed that total stall but not the report, because a second
+  // timer-shaped dependency was left behind — this 100ms coalescing window.
+  //
+  // Browsers clamp timers in a hidden page to at best once a second, and drop
+  // pages hidden for more than five minutes to roughly one wake-up a minute.
+  // The reporter saw a tab title stuck at 2% beside a page at 40%.
+  //
+  // The coalescing exists to stop rapid messages triggering a render cascade.
+  // A hidden tab is not painting, so there is no cascade to prevent there —
+  // the timer is pure cost, and it is exactly the thing being throttled. So
+  // when hidden, skip it and write immediately.
+  //
+  // Note "hidden", not "unfocused": on Windows a fully-occluded window reports
+  // visibilityState 'hidden' too, which is why the reporter saw this from
+  // merely clicking away rather than only from switching tabs.
   const throttledPrinterStatusUpdate = useCallback((printerId: number, data: Record<string, unknown>) => {
     // Merge with any pending data for this printer
     const existing = pendingPrinterStatus.current.get(printerId) || {};
     pendingPrinterStatus.current.set(printerId, { ...existing, ...data });
 
+    if (document.hidden) {
+      flushPrinterStatus();
+      return;
+    }
+
     // Schedule update if not already scheduled
     if (!printerStatusTimeoutRef.current) {
-      printerStatusTimeoutRef.current = window.setTimeout(() => {
-        const updates = new Map(pendingPrinterStatus.current);
-        pendingPrinterStatus.current.clear();
-        printerStatusTimeoutRef.current = null;
-
-        // Apply all pending updates
-        requestAnimationFrame(() => {
-          updates.forEach((statusData, id) => {
-            queryClient.setQueryData(
-              ['printerStatus', id],
-              (old: Record<string, unknown> | undefined) => {
-                const merged = { ...old, ...statusData };
-                if (merged.wifi_signal == null && old?.wifi_signal != null) {
-                  merged.wifi_signal = old.wifi_signal;
-                }
-                return merged;
-              }
-            );
-          });
-        });
-      }, 100); // Update at most every 100ms
+      printerStatusTimeoutRef.current = window.setTimeout(flushPrinterStatus, 100);
     }
-  }, [queryClient]);
+  }, [flushPrinterStatus]);
 
   // Debounced invalidation helper - coalesces multiple rapid invalidations
   const debouncedInvalidate = useCallback((queryKey: string) => {
@@ -174,17 +274,32 @@ export function useWebSocket() {
       pendingInvalidations.current.clear();
       invalidationTimeoutRef.current = null;
 
-      // Invalidate queries one at a time with delays to prevent freeze
+      // Invalidate queries one at a time with delays to prevent freeze.
+      // The 500ms stagger is the anti-cascade measure; a frame callback around
+      // each invalidation used to sit inside it and stalled these refreshes in
+      // a hidden tab for the same reason as the status writes above (#2754).
       let delay = 0;
       keys.forEach((key) => {
         setTimeout(() => {
-          requestAnimationFrame(() => {
-            queryClient.invalidateQueries({ queryKey: [key] });
-          });
+          queryClient.invalidateQueries({ queryKey: [key] });
         }, delay);
         delay += 500; // 500ms between each invalidation
       });
     }, 3000);
+  }, [queryClient]);
+
+  // Slot changes skip the cascade debounce above. That debounce exists for
+  // print completion, where one event fans out across half the app; a spool
+  // swap touches one slot and the user is standing at the printer looking at
+  // the card. Waiting 3s of quiet and then staggering the keys 500ms apart put
+  // several seconds of visibly wrong data on screen for no benefit, and the
+  // timer restarts on every further event, so a busy moment could defer it
+  // indefinitely. React Query coalesces repeat invalidations of one key, so a
+  // Spoolman sync reporting a dozen slots at once still costs three refetches.
+  const invalidateSlotQueries = useCallback(() => {
+    queryClient.invalidateQueries({ queryKey: ['spool-assignments'] });
+    queryClient.invalidateQueries({ queryKey: ['spoolman-slot-assignments'] });
+    queryClient.invalidateQueries({ queryKey: ['slotPresets'] });
   }, [queryClient]);
 
   const handleMessage = useCallback((message: WebSocketMessage) => {
@@ -238,6 +353,20 @@ export function useWebSocket() {
         debouncedInvalidate('archiveStats');
         break;
 
+      case 'kill_switch_triggered': {
+        const printer = message.printer_name || `Printer ${message.printer_id ?? '?'}`;
+        const filename = message.filename || t('common.unknown');
+        showToast(t('printers.toast.killSwitchTriggered', { printer, filename }), 'error');
+        break;
+      }
+
+      case 'billing_charge_failed': {
+        const printer = message.printer_name || `Printer ${message.printer_id ?? '?'}`;
+        const filename = message.filename || t('common.unknown');
+        showToast(t('printers.toast.billingChargeFailed', { printer, filename }), 'error');
+        break;
+      }
+
       case 'archive_created':
         debouncedInvalidate('archives');
         debouncedInvalidate('archiveStats');
@@ -266,18 +395,52 @@ export function useWebSocket() {
       case 'inventory_changed':
         // Spool created/updated/deleted/archived/restored - refresh inventory across all tabs
         debouncedInvalidate('inventory-spools');
+        debouncedInvalidate('spoolman-inventory-spools');
+        debouncedInvalidate(inventoryLocationsQueryKey[0]);
         break;
 
       case 'spool_assignment_changed':
-        // Spool assigned/unassigned - refresh assignment data across all tabs
-        debouncedInvalidate('spool-assignments');
-        debouncedInvalidate('slotPresets');
+        // Spool assigned/unassigned - refresh assignment data across all tabs.
+        // Both inventory modes: the Spoolman AMS sync raises this event too, and
+        // its slot rows live under their own query keys.
+        invalidateSlotQueries();
         break;
 
+      case 'spool_assignment_verified': {
+        // #2582: the backend read the AMS telemetry back after an assignment
+        // and either confirmed the tray accepted it or timed out. Toast the
+        // outcome so the AMS→Studio hand-off is no longer silent.
+        // Backend always supplies printer_name (falls back to "Printer <id>"),
+        // so the '||' here only guards a malformed payload.
+        const printer = message.printer_name || 'Printer';
+        const slot = message.slot || '?';
+        if (message.verified) {
+          if (message.kprofile_applied === false) {
+            // Filament id landed but the K-profile (cali_idx) did not — the
+            // exact "loaded but no flow profile" case the reporter chased.
+            showToast(
+              t('printers.toast.assignmentVerifiedNoKprofile', { slot, printer }),
+              'warning'
+            );
+          } else {
+            showToast(t('printers.toast.assignmentVerified', { slot, printer }), 'success');
+          }
+        } else {
+          showToast(t('printers.toast.assignmentNotConfirmed', { slot, printer }), 'warning');
+        }
+        break;
+      }
+
       case 'spool_auto_assigned':
-        // RFID tag matched - refresh inventory and assignment data
+        // RFID tag matched - refresh inventory and assignment data.
+        // slotPresets is not optional here: auto-assigning rewrites the slot's
+        // slot_preset_mappings row, and the AMS slot card reads that row ahead
+        // of the live tray_info_idx. Leave it cached and swapping a spool keeps
+        // the *previous* spool's preset name on the card -- the rest of the
+        // card updates off the status push, so it reads as one wrong line
+        // rather than a stale card. Only the manual assign path invalidated it.
         debouncedInvalidate('inventory-spools');
-        debouncedInvalidate('spool-assignments');
+        invalidateSlotQueries();
         break;
 
       case 'spool_usage_logged':
@@ -285,26 +448,37 @@ export function useWebSocket() {
         debouncedInvalidate('inventory-spools');
         break;
 
-      case 'unknown_tag':
-        // Unknown RFID tag detected - dispatch event for UI
+      case 'unknown_tag': {
+        // Unknown RFID tag detected — dispatch event for UI. The backend
+        // ships the slot's current tray data alongside the event so
+        // consumers don't have to look it up from the (frequently stale)
+        // cached printerStatus query.
+        const m = message as unknown as {
+          printer_id?: number;
+          ams_id?: number;
+          tray_id?: number;
+          tag_uid?: string;
+          tray_uuid?: string;
+          tray_type?: string | null;
+          tray_color?: string | null;
+          tray_sub_brands?: string | null;
+          tray_count?: number | null;
+        };
         window.dispatchEvent(new CustomEvent('unknown-tag', {
           detail: {
-            printer_id: (message as unknown as { printer_id?: number }).printer_id,
-            ams_id: (message as unknown as { ams_id?: number }).ams_id,
-            tray_id: (message as unknown as { tray_id?: number }).tray_id,
-            tag_uid: (message as unknown as { tag_uid?: string }).tag_uid,
-            tray_uuid: (message as unknown as { tray_uuid?: string }).tray_uuid,
+            printer_id: m.printer_id,
+            ams_id: m.ams_id,
+            tray_id: m.tray_id,
+            tag_uid: m.tag_uid,
+            tray_uuid: m.tray_uuid,
+            tray_type: m.tray_type,
+            tray_color: m.tray_color,
+            tray_sub_brands: m.tray_sub_brands,
+            tray_count: m.tray_count,
           }
         }));
         break;
-
-      case 'background_dispatch':
-        window.dispatchEvent(
-          new CustomEvent('background-dispatch', {
-            detail: (message as unknown as { data?: Record<string, unknown> }).data || {},
-          })
-        );
-        break;
+      }
 
       case 'spoolbuddy_weight':
         window.dispatchEvent(new CustomEvent('spoolbuddy-weight', { detail: message }));
@@ -347,8 +521,33 @@ export function useWebSocket() {
         debouncedInvalidate('spoolbuddy-devices');
         debouncedInvalidate('spoolbuddy-update-check');
         break;
+
+      // Dispatch toast lifecycle (#1625 follow-up — restored the upload
+      // progress UI that the scheduler unification removed). Four backend
+      // event types collapse to one frontend channel. No
+      // `queue_item_queued` (the toast must wait for the upload to
+      // actually start) and no `queue_item_dispatched` (the legacy
+      // background-dispatch flow kept status='processing' from upload
+      // start until printer ack — the "Awaiting printer…" subtitle is
+      // derived from upload_progress_pct >= 99.9, not from a separate
+      // event).
+      case 'queue_item_uploading':
+      case 'queue_item_upload_progress':
+      case 'queue_item_acked':
+      case 'queue_item_failed':
+        window.dispatchEvent(new CustomEvent('bambuddy:dispatch-toast', { detail: message }));
+        break;
+      // Slicer Pipeline runs (#1425 PR C). State transitions on the run
+      // refresh both the dashboard list AND the per-pipeline "Last run"
+      // chip in Settings → Pipelines.
+      case 'pipeline_run_updated':
+        queryClient.invalidateQueries({ queryKey: ['pipeline-runs-all'] });
+        if (message.run?.pipeline_id) {
+          queryClient.invalidateQueries({ queryKey: ['pipeline-runs', message.run.pipeline_id] });
+        }
+        break;
     }
-  }, [queryClient, debouncedInvalidate, throttledPrinterStatusUpdate, showToast, t]);
+  }, [queryClient, debouncedInvalidate, invalidateSlotQueries, throttledPrinterStatusUpdate, showToast, t]);
 
   // Keep the ref updated with latest handleMessage
   useEffect(() => {
@@ -356,9 +555,16 @@ export function useWebSocket() {
   }, [handleMessage]);
 
   useEffect(() => {
-    connect();
+    // connect() is async after the GHSA-r2qv fix (mints a ws-token first).
+    // Fire-and-forget at mount; the inner reconnect loop also calls
+    // connect() in the ws.onclose handler.
+    disposedRef.current = false;
+    void connect();
 
     return () => {
+      // Mark disposed BEFORE closing so the ws.onclose triggered by close()
+      // sees it and won't schedule a post-unmount reconnect.
+      disposedRef.current = true;
       if (reconnectTimeoutRef.current) {
         clearTimeout(reconnectTimeoutRef.current);
       }

@@ -15,7 +15,8 @@
 # Builds and pushes a multi-arch Docker image tagged as 'daily'. Each push overwrites the
 # previous 'daily' image. A GitHub prerelease is created with a date-stamped tag for history.
 #
-# Users can stay up to date by pulling the 'daily' tag or using Watchtower:
+# Users can stay up to date by pulling the 'daily' tag or using Watchtower
+# (https://watchtower.nickfedor.com, image 'nickfedor/watchtower'):
 #   docker pull ghcr.io/maziggy/bambuddy:daily
 #
 # Prerequisites:
@@ -56,6 +57,7 @@ PARALLEL=false
 PUSH_GHCR=true
 PUSH_DOCKERHUB=true
 SKIP_RELEASE=false
+INCLUDE_SIDECARS=false
 for arg in "$@"; do
     case $arg in
         --parallel)
@@ -70,17 +72,22 @@ for arg in "$@"; do
         --skip-release)
             SKIP_RELEASE=true
             ;;
+        --include-sidecars)
+            INCLUDE_SIDECARS=true
+            ;;
         --help|-h)
-            echo "Usage: $0 [--parallel] [--ghcr-only] [--dockerhub-only] [--skip-release]"
+            echo "Usage: $0 [--parallel] [--ghcr-only] [--dockerhub-only] [--skip-release] [--include-sidecars]"
             echo ""
             echo "Build and publish a daily beta Docker image using the APP_VERSION from config.py."
             echo ""
             echo "Options:"
-            echo "  --parallel       Build both architectures simultaneously"
-            echo "  --ghcr-only      Only push to GitHub Container Registry"
-            echo "  --dockerhub-only Only push to Docker Hub"
-            echo "  --skip-release   Build+push without creating/updating GitHub release"
-            echo "  --help, -h       Show this help"
+            echo "  --parallel          Build both architectures simultaneously"
+            echo "  --ghcr-only         Only push to GitHub Container Registry"
+            echo "  --dockerhub-only    Only push to Docker Hub"
+            echo "  --skip-release      Build+push without creating/updating GitHub release"
+            echo "  --include-sidecars  Also rebuild + push orca-slicer-api and bambu-studio-api"
+            echo "                      images (off by default — slicer rebuilds are expensive)"
+            echo "  --help, -h          Show this help"
             exit 0
             ;;
         *)
@@ -334,7 +341,7 @@ docker pull maziggy/bambuddy:daily"
 > ${PULL_COMMANDS}
 > \`\`\`
 >
-> **Tip:** Use [Watchtower](https://containrrr.dev/watchtower/) to automatically update when new daily builds are pushed.
+> **Tip:** Use [Watchtower](https://watchtower.nickfedor.com) (image \`nickfedor/watchtower\`) to automatically update when new daily builds are pushed.
 
 ---
 
@@ -418,4 +425,27 @@ fi
 if [ "$PUSH_DOCKERHUB" = true ]; then
     echo "  docker pull ${DOCKERHUB_IMAGE}:daily"
     echo "  docker pull ${IMAGE_NAME}:daily  # shorthand"
+fi
+
+# ============================================================
+# Sidecar images (orca-slicer-api + bambu-studio-api) — opt-in for daily
+# ============================================================
+SIDECAR_SCRIPT="/opt/claude/projects/orca-slicer-api/docker-publish-sidecars.sh"
+if [ "$INCLUDE_SIDECARS" != true ]; then
+    echo ""
+    echo -e "${YELLOW}Sidecar images not rebuilt (daily default).${NC}"
+    echo -e "${YELLOW}Pass --include-sidecars to also publish orca-slicer-api + bambu-studio-api.${NC}"
+elif [ ! -x "$SIDECAR_SCRIPT" ]; then
+    echo ""
+    echo -e "${YELLOW}Sidecar helper not found at ${SIDECAR_SCRIPT} — skipping sidecar build.${NC}"
+else
+    echo ""
+    echo -e "${GREEN}================================================${NC}"
+    echo -e "${GREEN}  Publishing sidecar images (daily channel)${NC}"
+    echo -e "${GREEN}================================================${NC}"
+    SIDECAR_ARGS="--channel daily --version ${VERSION}"
+    [ "$PARALLEL" = true ]        && SIDECAR_ARGS="$SIDECAR_ARGS --parallel"
+    [ "$PUSH_GHCR" = false ]      && SIDECAR_ARGS="$SIDECAR_ARGS --dockerhub-only"
+    [ "$PUSH_DOCKERHUB" = false ] && SIDECAR_ARGS="$SIDECAR_ARGS --ghcr-only"
+    "$SIDECAR_SCRIPT" $SIDECAR_ARGS
 fi

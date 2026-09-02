@@ -1,5 +1,5 @@
 import { Component, type ReactNode, type ErrorInfo } from 'react';
-import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
+import { BrowserRouter, Routes, Route, Navigate, useLocation } from 'react-router-dom';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { Layout } from './components/Layout';
 import { PrintersPage } from './pages/PrintersPage';
@@ -7,6 +7,7 @@ import { ArchivesPage } from './pages/ArchivesPage';
 import { QueuePage } from './pages/QueuePage';
 import { StatsPage } from './pages/StatsPage';
 import { SettingsPage } from './pages/SettingsPage';
+import { FinancePage } from './pages/FinancePage';
 import { ProfilesPage } from './pages/ProfilesPage';
 import { MaintenancePage } from './pages/MaintenancePage';
 import { ProjectsPage } from './pages/ProjectsPage';
@@ -14,6 +15,7 @@ import { ProjectDetailPage } from './pages/ProjectDetailPage';
 import { FileManagerPage } from './pages/FileManagerPage';
 import { LibraryTrashPage } from './pages/LibraryTrashPage';
 import { CameraPage } from './pages/CameraPage';
+import { CamWallPage } from './pages/CamWallPage';
 import { StreamOverlayPage } from './pages/StreamOverlayPage';
 import { ExternalLinkPage } from './pages/ExternalLinkPage';
 import { GroupEditPage } from './pages/GroupEditPage';
@@ -25,6 +27,7 @@ import { SetupPage } from './pages/SetupPage';
 import { NotificationsPage } from './pages/NotificationsPage';
 import { GCodeViewerPage } from './pages/GCodeViewerPage';
 import { useWebSocket } from './hooks/useWebSocket';
+import { usePrintProgressTitle } from './hooks/usePrintProgressTitle';
 import { useStreamTokenSync } from './hooks/useCameraStreamToken';
 import { ThemeProvider } from './contexts/ThemeContext';
 import { ToastProvider } from './contexts/ToastContext';
@@ -88,18 +91,20 @@ function StreamTokenSync() {
 
 function WebSocketProvider({ children }: { children: React.ReactNode }) {
   useWebSocket();
+  usePrintProgressTitle();
   return <>{children}</>;
 }
 
 function ProtectedRoute({ children }: { children: React.ReactNode }) {
   const { authEnabled, loading, user } = useAuth();
+  const location = useLocation();
 
   if (loading) {
     return <div className="min-h-screen flex items-center justify-center">Loading...</div>;
   }
 
   if (authEnabled && !user) {
-    return <Navigate to="/login" replace />;
+    return <Navigate to="/login" replace state={{ from: location }} />;
   }
 
   return <>{children}</>;
@@ -112,6 +117,7 @@ function PermissionRoute({ permission, children }: { permission: string; childre
   // (e.g. settings:read grants read-only access to Settings; specific tabs
   // require their own permissions like users:read, groups:update, etc.).
   const { authEnabled, loading, user, hasPermission } = useAuth();
+  const location = useLocation();
 
   if (loading) {
     return <div className="min-h-screen flex items-center justify-center">Loading...</div>;
@@ -123,7 +129,7 @@ function PermissionRoute({ permission, children }: { permission: string; childre
   }
 
   if (!user) {
-    return <Navigate to="/login" replace />;
+    return <Navigate to="/login" replace state={{ from: location }} />;
   }
 
   if (!hasPermission(permission as Parameters<typeof hasPermission>[0])) {
@@ -153,10 +159,16 @@ function SetupRoute({ children }: { children: React.ReactNode }) {
 function App() {
   return (
     <ErrorBoundary>
-    <ThemeProvider>
       <ToastProvider>
         <QueryClientProvider client={queryClient}>
           <AuthProvider>
+            {/* ThemeProvider sits inside AuthProvider so its initial
+                ``api.getSettings()`` fetch can wait for AuthContext to
+                resolve — otherwise it fires unconditionally on every
+                login page load and returns 401. ErrorBoundary uses
+                inline styles, so a missing theme on a crash screen is
+                not a regression. */}
+            <ThemeProvider>
             <ColorCatalogProvider>
             <SliceJobTrackerProvider>
             <StreamTokenSync />
@@ -174,6 +186,11 @@ function App() {
                 {/* Stream overlay page - standalone for OBS/streaming embeds, no auth required */}
                 <Route path="/overlay/:printerId" element={<StreamOverlayPage />} />
 
+                {/* Cam Wall on its own URL (#2531). Outside ProtectedRoute because a
+                    ?token= kiosk has no session to protect; the page itself sends a
+                    tokenless visitor to /login, and the backend gates the feed. */}
+                <Route path="/camwall" element={<CamWallPage />} />
+
                 {/* SpoolBuddy kiosk UI */}
                 <Route element={<ProtectedRoute><WebSocketProvider><SpoolBuddyLayout /></WebSocketProvider></ProtectedRoute>}>
                   <Route path="spoolbuddy" element={<SpoolBuddyDashboard />} />
@@ -189,8 +206,13 @@ function App() {
                   <Route index element={<PrintersPage />} />
                   <Route path="archives" element={<ArchivesPage />} />
                   <Route path="queue" element={<QueuePage />} />
+                  {/* Slicer Pipelines (#1425) — Pipelines tab lives on the
+                      Print Queue page (Queue + History + Timeline +
+                      Pipelines). Old standalone URL redirects. */}
+                  <Route path="pipelines/runs" element={<Navigate to="/queue?tab=pipelines" replace />} />
                   <Route path="stats" element={<StatsPage />} />
                   <Route path="profiles" element={<ProfilesPage />} />
+                  <Route path="finance" element={<PermissionRoute permission="cost_centers:read_own"><FinancePage /></PermissionRoute>} />
                   <Route path="maintenance" element={<MaintenancePage />} />
                   <Route path="projects" element={<ProjectsPage />} />
                   <Route path="projects/:id" element={<ProjectDetailPage />} />
@@ -213,10 +235,10 @@ function App() {
             </BrowserRouter>
             </SliceJobTrackerProvider>
             </ColorCatalogProvider>
+            </ThemeProvider>
           </AuthProvider>
         </QueryClientProvider>
       </ToastProvider>
-    </ThemeProvider>
     </ErrorBoundary>
   );
 }

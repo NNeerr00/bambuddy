@@ -16,7 +16,7 @@ Enable the API path by:
 
 ```bash
 cd slicer-api/
-cp .env.example .env       # edit ports / versions if you like
+cp .env.example .env       # edit ports if you like
 
 # OrcaSlicer only (default profile):
 docker compose up -d
@@ -28,9 +28,20 @@ curl http://localhost:3001/health   # bambu-studio-api
 curl http://localhost:3003/health   # orca-slicer-api
 ```
 
-First build downloads the slicer's AppImage (~110 MB OrcaSlicer, ~220 MB
-BambuStudio) and compiles the Node wrapper. Takes 3–8 minutes per service.
-Subsequent runs reuse the local image — instant start.
+First start pulls pre-built images from GHCR (~110 MB OrcaSlicer,
+~220 MB BambuStudio). No local build, no git in the BuildKit worker,
+works on QNAP / Synology / Container Station out of the box.
+
+Both images are `linux/amd64` only. OrcaSlicer's ARM64 build is on hold
+pending an upstream extraction fix; BambuStudio doesn't publish ARM64
+at all. For ARM64 hosts (Raspberry Pi 4/5, Apple Silicon Linux), run
+the sidecar on a separate x86_64 box and point Bambuddy at it via the
+**Sidecar URL** field — the sidecar doesn't need to live next to Bambuddy.
+
+If a separate x86_64 box isn't an option, the amd64 images can be run on
+an ARM64 host under emulation — experimental, roughly 3-6x slower than
+native, and a stopgap until native ARM64 images ship. See
+[Experimental setup for ARM64](#experimental-setup-for-arm64) below.
 
 ## Ports
 
@@ -55,32 +66,100 @@ In the Bambuddy UI: **Settings → Slicer**:
 Leaving the URL field blank uses the `SLICER_API_URL` /
 `BAMBU_STUDIO_API_URL` environment defaults from Bambuddy's config.
 
-## Where the source lives
+## Where the images live
 
-Both images build from the
+Pre-built images are published to two registries on every Bambuddy
+stable release:
+
+- `ghcr.io/maziggy/orca-slicer-api:latest` / `docker.io/maziggy/orca-slicer-api:latest`
+- `ghcr.io/maziggy/bambu-studio-api:latest` / `docker.io/maziggy/bambu-studio-api:latest`
+
+Each release also publishes a versioned tag (`:bambuddy-X.Y.Z`) so you
+can pin to the sidecar that shipped alongside a specific Bambuddy
+release — set `SIDECAR_TAG=bambuddy-0.2.5` in `.env`.
+
+Both images are built from the
 [`maziggy/orca-slicer-api`](https://github.com/maziggy/orca-slicer-api)
-fork (`bambuddy/profile-resolver` branch). The Compose file uses
-Docker's git build context, so you don't need to clone it manually —
-Docker pulls the repo at build time.
-
-The fork patches AFKFelix's upstream wrapper with the `inherits:`
-chain resolver, `from: "User"` → `"system"` rewrite, `# ` clone-prefix
-strip, and sentinel-value strip — all empirically required to slice
-real GUI exports without segfaulting the CLI. Once those land
-upstream, this Compose file can be flipped to pull from
-`ghcr.io/afkfelix/orca-slicer-api` directly.
+fork (`bambuddy/profile-resolver` branch). The fork patches AFKFelix's
+upstream wrapper with the `inherits:` chain resolver, `from: "User"`
+→ `"system"` rewrite, `# ` clone-prefix strip, and sentinel-value
+strip — all empirically required to slice real GUI exports without
+segfaulting the CLI. Once those land upstream, the compose file can be
+flipped back to `ghcr.io/afkfelix/orca-slicer-api`.
 
 ## Updating
 
-Bump the versions in `.env`, then:
+OrcaSlicer only (the default):
 
 ```bash
-docker compose --profile bambu build --no-cache
+docker compose pull
+docker compose up -d
+```
+
+With the Bambu Studio sidecar — the profile flag belongs on **both**
+commands:
+
+```bash
+docker compose --profile bambu pull
 docker compose --profile bambu up -d
 ```
 
-`--no-cache` is needed because the Dockerfile downloads the AppImage
-inline; Docker won't re-fetch it on a version change otherwise.
+`bambu-studio-api` sits behind `profiles: [bambu]`, and a bare
+`docker compose pull` skips profile-gated services silently: it reports
+success, `restart: unless-stopped` keeps the old container serving, and
+you stay on the old image no matter how often you repeat it. To update
+one sidecar only, name it — `docker compose pull bambu-studio-api &&
+docker compose up -d bambu-studio-api` — which enables its profile
+implicitly.
+
+Compose pulls the current `:latest` (or whatever `SIDECAR_TAG` you've
+pinned to) and recreates the containers.
+
+To roll back to the sidecar that shipped with a previous Bambuddy
+release, set `SIDECAR_TAG=bambuddy-X.Y.Z` in `.env` and re-run the two
+commands above.
+
+## Experimental setup for ARM64
+
+Runs the `linux/amd64` images on an ARM64 host under QEMU emulation, via
+the `docker-compose.arm64.yml` override in this folder. Expect roughly
+3-6x slower slicing than native, worsening with model complexity. This is
+a stopgap until native ARM64 images ship, not a replacement for running
+the sidecar on an x86_64 box — if you have one, use it.
+
+**Set up QEMU binfmt on the host first**, or the containers fail with
+`exec format error`. On Debian/Ubuntu that is `qemu-user-static` plus
+`binfmt-support`; Docker Desktop on Apple Silicon already has it. The
+per-distribution commands are in the
+[wiki](https://wiki.bambuddy.cool/features/slicer-api/) — do that before
+the steps below.
+
+### Quick start for ARM64
+
+```bash
+cd slicer-api/
+cp .env.example .env       # edit ports if you like
+
+# Make every later `docker compose` command pick up the ARM64 override:
+echo 'COMPOSE_FILE=docker-compose.yml:docker-compose.arm64.yml' >> .env
+
+# OrcaSlicer only (default profile):
+docker compose up -d
+curl http://localhost:3003/health
+
+# Both slicers:
+docker compose --profile bambu up -d
+curl http://localhost:3001/health   # bambu-studio-api
+curl http://localhost:3003/health   # orca-slicer-api
+```
+
+That `COMPOSE_FILE` line is what makes the rest of this README work
+unchanged on ARM64 — **Updating** included. Without it every command has
+to name both files (`docker compose -f docker-compose.yml -f
+docker-compose.arm64.yml …`), and the first bare `docker compose pull` or
+`up -d` drops the override: on a host with no amd64 emulation registered
+for that image you get a manifest error, and once native ARM64 images
+exist you would silently switch between them and back.
 
 ## Troubleshooting
 

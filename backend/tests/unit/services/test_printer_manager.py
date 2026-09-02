@@ -10,6 +10,8 @@ import pytest
 
 from backend.app.services.printer_manager import (
     PrinterManager,
+    display_temperatures,
+    drying_screen_only,
     get_derived_status_name,
     has_stg_cur_idle_bug,
     init_printer_connections,
@@ -17,6 +19,7 @@ from backend.app.services.printer_manager import (
     printer_state_to_dict,
     supports_chamber_temp,
     supports_drying,
+    supports_drying_while_printing,
 )
 
 
@@ -50,6 +53,19 @@ class TestPrinterManager:
         client.state.temperatures = {"nozzle": 25, "bed": 25}
         client.state.raw_data = {}
         client.logging_enabled = False
+
+        # mark_power_off is real logic on BambuMQTTClient (#2629) — mirror it so
+        # the manager tests still exercise the state transition they assert on.
+        # The real implementation (and its recovery path) is covered in
+        # test_bambu_mqtt.py::TestPresumedPowerOffRecovery.
+        def _mark_power_off():
+            if not client.state.connected:
+                return False
+            client.state.connected = False
+            client.state.state = "unknown"
+            return True
+
+        client.mark_power_off.side_effect = _mark_power_off
         return client
 
     # ========================================================================
@@ -372,11 +388,14 @@ class TestPrinterManager:
             1,
             ams_mapping=None,
             timelapse=False,
-            bed_levelling=True,
-            flow_cali=False,
+            bed_levelling="auto",
+            flow_cali="auto",
             vibration_cali=True,
             layer_inspect=False,
             use_ams=True,
+            nozzle_offset_cali="auto",
+            nozzle_mapping=None,
+            nozzle_slot_extruders=None,
         )
         assert result is True
 
@@ -472,6 +491,46 @@ class TestPrinterManager:
         result = await manager.wait_for_cooldown(1, target_temp=50)
 
         assert result is True
+
+    # ========================================================================
+    # Tests for is_print_active (#1890)
+    # ========================================================================
+
+    @pytest.mark.parametrize(
+        "state,expected",
+        [
+            ("RUNNING", True),
+            ("PAUSE", True),
+            ("PREPARE", True),
+            ("SLICING", True),
+            ("FINISH", False),
+            ("IDLE", False),
+            ("FAILED", False),
+            ("unknown", False),
+        ],
+    )
+    def test_is_print_active_state_matrix(self, manager, mock_client, state, expected):
+        """A job-loaded state is 'active'; idle/terminal states are not."""
+        mock_client.state.connected = True
+        mock_client.state.state = state
+        mock_client.check_staleness.return_value = True
+        manager._clients[1] = mock_client
+
+        assert manager.is_print_active(1) is expected
+
+    def test_is_print_active_false_when_disconnected(self, manager, mock_client):
+        """Even in RUNNING, a disconnected printer is not treated as active —
+        we fail safe (no active print) only for the 'nothing printing' cases."""
+        mock_client.state.connected = False
+        mock_client.state.state = "RUNNING"
+        mock_client.check_staleness.return_value = False
+        manager._clients[1] = mock_client
+
+        assert manager.is_print_active(1) is False
+
+    def test_is_print_active_false_for_unknown_printer(self, manager):
+        """Unknown printer id → not active (no client)."""
+        assert manager.is_print_active(999) is False
 
     # ========================================================================
     # Tests for logging methods
@@ -790,7 +849,90 @@ class TestPrinterStateToDict:
         state.raw_data = {}
         state.stg_cur = -1  # No calibration stage active
         state.firmware_version = None
+        state.extruder_slots = {}
         return state
+
+    def test_fila_switch_and_inlets_ride_the_websocket(self, mock_state):
+        """The FTS fields must be in the broadcast dict, not only the REST status.
+
+        The frontend shallow-merges each WebSocket push over its cached status,
+        so a field this dict omits keeps whatever the last full fetch left —
+        which is why the AMS inlet badges only ever changed on a page reload.
+        """
+        from backend.app.services.bambu_mqtt import FilaSwitchState
+
+        mock_state.fila_switch = FilaSwitchState(
+            installed=True, in_slots=[-1, 0x0102], out_extruders=[1, 0], stat=0, info=1
+        )
+        mock_state.ams_switch_inlet = {"0": "A", "1": "B"}
+
+        result = printer_state_to_dict(mock_state)
+
+        assert result["ams_switch_inlet"] == {"0": "A", "1": "B"}
+        assert result["fila_switch"] == {
+            "installed": True,
+            "in_slots": [-1, 0x0102],
+            "out_extruders": [1, 0],
+            "stat": 0,
+            "info": 1,
+            "ready": True,
+        }
+
+    def test_a_switch_is_not_ready_until_every_ams_has_an_inlet(self, mock_state):
+        """An AMS with no inlet binding means the switch cannot route a load.
+
+        The load dialog blocks on this rather than publishing a command the
+        firmware will drop, the same way BambuStudio's DevFilaSwitch::IsReady
+        gates its own dialog.
+        """
+        from backend.app.services.bambu_mqtt import FilaSwitchState
+
+        mock_state.fila_switch = FilaSwitchState(installed=True)
+        mock_state.raw_data = {"ams": [{"id": "0", "tray": []}, {"id": "1", "tray": []}]}
+        mock_state.ams_switch_inlet = {"0": "A"}
+
+        assert printer_state_to_dict(mock_state)["fila_switch"]["ready"] is False
+
+        mock_state.ams_switch_inlet = {"0": "A", "1": "B"}
+
+        assert printer_state_to_dict(mock_state)["fila_switch"]["ready"] is True
+
+    def test_extruder_slots_ride_the_websocket(self, mock_state):
+        """Which hotend holds which slot has to travel with every push.
+
+        The AMS slot menu decides from it which hotend the load dialog may
+        offer, and tray_now cannot stand in: it is one value for the whole
+        printer, so with both hotends loaded it names only one of them.
+        """
+        from backend.app.services.bambu_mqtt import ExtruderSlot
+
+        mock_state.extruder_slots = {
+            0: ExtruderSlot(ams_id=0, slot_id=2, has_filament=True),
+            1: ExtruderSlot(ams_id=None, slot_id=None, has_filament=False),
+        }
+
+        result = printer_state_to_dict(mock_state)
+
+        assert result["extruder_slots"] == {
+            "0": {"ams_id": 0, "slot_id": 2, "has_filament": True},
+            "1": {"ams_id": None, "slot_id": None, "has_filament": False},
+        }
+
+    def test_extruder_slots_are_empty_when_unreported(self, mock_state):
+        """Printers outside the H2/X2 series never send the block."""
+        assert printer_state_to_dict(mock_state)["extruder_slots"] == {}
+
+    def test_inlets_are_dropped_without_a_switch(self, mock_state):
+        """A binding must not outlive the accessory being unplugged."""
+        from backend.app.services.bambu_mqtt import FilaSwitchState
+
+        mock_state.fila_switch = FilaSwitchState(installed=False)
+        mock_state.ams_switch_inlet = {"0": "A"}
+
+        result = printer_state_to_dict(mock_state)
+
+        assert result["fila_switch"] is None
+        assert result["ams_switch_inlet"] == {}
 
     def test_basic_conversion(self, mock_state):
         """Verify basic state fields are converted."""
@@ -928,6 +1070,39 @@ class TestPrinterStateToDict:
         result = printer_state_to_dict(mock_state)
 
         assert result["ams"][0]["tray"][0]["tag_uid"] is None
+
+    def test_exists_bit_is_serialized_for_websocket(self, mock_state):
+        """#2670: the WS status payload must carry the firmware presence bit
+        `exists` (set by apply_tray_exist_bits) — the REST serializer already
+        does. Without it the frontend shallow-merge drops `exists` after the
+        first WS frame and getEmptySlotKind falls back to the firmware-variant
+        state 9/10 heuristic, which is wrong for AMS-HT in both directions.
+        """
+        mock_state.raw_data = {
+            "ams": [
+                {
+                    "id": 128,
+                    "tray": [
+                        # Empty HT: apply_tray_exist_bits cleared it and set exists=False.
+                        {"id": 0, "state": 9, "tray_type": "", "exists": False},
+                    ],
+                },
+                {
+                    "id": 0,
+                    "tray": [
+                        # Present non-RFID spool: exists=True, no tray_type ("?").
+                        {"id": 0, "state": 10, "tray_type": "", "exists": True},
+                    ],
+                },
+            ]
+        }
+
+        result = printer_state_to_dict(mock_state)
+
+        ht_tray = result["ams"][0]["tray"][0]
+        reg_tray = result["ams"][1]["tray"][0]
+        assert ht_tray["exists"] is False
+        assert reg_tray["exists"] is True
 
     def test_vt_tray_parsing(self, mock_state):
         """Verify virtual tray is parsed correctly as a list."""
@@ -1242,6 +1417,221 @@ class TestStatusKeyDryingDedup:
         assert result1["ams"] != result2["ams"]
 
 
+class TestDryingTargetExposure:
+    """Tests for dry_target_temp / dry_filament surfacing on AMS state dict.
+
+    Bambu does not echo the active cycle's chosen filament + target
+    temperature on the per-tick AMS push, only the dry_time countdown.
+    The badge needs the cached target so it can render "PETG @ 65°C".
+    """
+
+    def _state_with_ams(self, ams_data: dict) -> object:
+        state = MagicMock()
+        state.connected = True
+        state.state = "IDLE"
+        state.current_print = None
+        state.subtask_name = None
+        state.gcode_file = None
+        state.progress = 0
+        state.remaining_time = 0
+        state.layer_num = 0
+        state.total_layers = 0
+        state.temperatures = {"nozzle": 25, "bed": 25}
+        state.hms_errors = []
+        state.ams_status_main = 0
+        state.ams_status_sub = 0
+        state.tray_now = None
+        state.wifi_signal = -50
+        state.stg_cur = -1
+        state.raw_data = {"ams": [ams_data]}
+        return state
+
+    def test_cached_target_wins_over_tray_fallback(self):
+        """When the cache has a target for this AMS, use it verbatim — even
+        if the loaded tray's filament/recommended-drying-temp differ."""
+        state = self._state_with_ams(
+            {
+                "id": 0,
+                "dry_time": 600,
+                "tray": [
+                    {"id": 0, "tray_type": "PLA", "drying_temp": 50, "state": 11},
+                ],
+            }
+        )
+        result = printer_state_to_dict(state, drying_targets={0: {"filament": "PETG", "temp": 65}})
+        assert result["ams"][0]["dry_filament"] == "PETG"
+        assert result["ams"][0]["dry_target_temp"] == 65
+
+    def test_falls_back_to_loaded_tray_filament_when_no_cache(self):
+        """No cached target → name the filament from the loaded trays when they
+        agree on a type. The temperature stays unknown: only the cache records
+        what we actually sent."""
+        state = self._state_with_ams(
+            {
+                "id": 0,
+                "dry_time": 600,
+                "tray": [
+                    {"id": 0, "tray_type": "ABS", "drying_temp": 70, "state": 11},
+                ],
+            }
+        )
+        result = printer_state_to_dict(state, drying_targets=None)
+        assert result["ams"][0]["dry_filament"] == "ABS"
+        assert result["ams"][0]["dry_target_temp"] is None
+
+    def test_returns_none_when_no_cache_and_empty_trays(self):
+        """No cache + no loaded tray with tray_type → both fields are None."""
+        state = self._state_with_ams(
+            {
+                "id": 0,
+                "dry_time": 600,
+                "tray": [{"id": 0}],
+            }
+        )
+        result = printer_state_to_dict(state, drying_targets={})
+        assert result["ams"][0]["dry_filament"] is None
+        assert result["ams"][0]["dry_target_temp"] is None
+
+    def test_targets_for_other_ams_id_dont_leak(self):
+        """A cached target for AMS 1 must not surface on AMS 0."""
+        state = self._state_with_ams(
+            {
+                "id": 0,
+                "dry_time": 600,
+                "tray": [{"id": 0}],
+            }
+        )
+        result = printer_state_to_dict(state, drying_targets={1: {"filament": "PETG", "temp": 65}})
+        assert result["ams"][0]["dry_filament"] is None
+        assert result["ams"][0]["dry_target_temp"] is None
+
+    def test_no_fallback_when_loaded_trays_disagree(self):
+        """#2759 — the reporter's AMS held 2 PETG and 2 PLA and was drying the
+        PLA at 45°C, but the fallback read slot 1 and labelled it "PETG @ 65°C".
+        A mixed unit gives no evidence of what the cycle is running, so the
+        badge must show the countdown alone rather than a confident wrong
+        answer."""
+        state = self._state_with_ams(
+            {
+                "id": 0,
+                "dry_time": 719,
+                "tray": [
+                    {"id": 0, "tray_type": "PETG", "drying_temp": 65, "state": 11},
+                    {"id": 1, "tray_type": "PETG", "drying_temp": 65, "state": 11},
+                    {"id": 2, "tray_type": "PLA", "drying_temp": 45, "state": 11},
+                    {"id": 3, "tray_type": "PLA", "drying_temp": 45, "state": 11},
+                ],
+            }
+        )
+        result = printer_state_to_dict(state, drying_targets={})
+        assert result["ams"][0]["dry_filament"] is None
+        assert result["ams"][0]["dry_target_temp"] is None
+
+    def test_fallback_survives_multiple_trays_of_one_type(self):
+        """Agreement across slots is still evidence of the filament — a unit
+        loaded entirely with PLA keeps the name the mixed case gives up."""
+        state = self._state_with_ams(
+            {
+                "id": 0,
+                "dry_time": 719,
+                "tray": [
+                    {"id": 0, "tray_type": "PLA", "drying_temp": 45, "state": 11},
+                    {"id": 1, "tray_type": "PLA", "drying_temp": 45, "state": 11},
+                    {"id": 2},
+                ],
+            }
+        )
+        result = printer_state_to_dict(state, drying_targets={})
+        assert result["ams"][0]["dry_filament"] == "PLA"
+
+    def test_uniform_unit_never_invents_a_temperature(self):
+        """#2759 follow-up — the reporter's second AMS held only PLA and was
+        drying at the 45°C they picked, but with no cached target the badge
+        answered with the RFID recommendation and read "PLA @ 55°C". Every
+        spool agreeing tells us the filament; it tells us nothing about a
+        temperature the user chose freely in the popover."""
+        state = self._state_with_ams(
+            {
+                "id": 0,
+                "dry_time": 719,
+                "tray": [
+                    {"id": 0, "tray_type": "PLA", "drying_temp": 55, "state": 11},
+                    {"id": 1, "tray_type": "PLA", "drying_temp": 55, "state": 11},
+                ],
+            }
+        )
+        result = printer_state_to_dict(state, drying_targets={})
+        assert result["ams"][0]["dry_filament"] == "PLA"
+        assert result["ams"][0]["dry_target_temp"] is None
+
+    def test_cached_temp_survives_a_unit_whose_trays_disagree(self):
+        """The cache is authoritative for both fields. A mixed unit costs us the
+        filament fallback but must not touch a target we actually sent."""
+        state = self._state_with_ams(
+            {
+                "id": 0,
+                "dry_time": 719,
+                "tray": [
+                    {"id": 0, "tray_type": "PETG", "drying_temp": 65, "state": 11},
+                    {"id": 1, "tray_type": "PLA", "drying_temp": 55, "state": 11},
+                ],
+            }
+        )
+        result = printer_state_to_dict(state, drying_targets={0: {"filament": "PLA", "temp": 45}})
+        assert result["ams"][0]["dry_filament"] == "PLA"
+        assert result["ams"][0]["dry_target_temp"] == 45
+
+
+class TestDisplayTemperatures:
+    """#1422 — the readings handed to the streaming overlay.
+
+    `state.temperatures` doubles as the MQTT client's working memory: alongside
+    the readings it carries derived heater flags and private timestamps. The
+    overlay feed is reached by a token rather than a login, so it gets an
+    allow-list rather than the dict.
+    """
+
+    def test_keeps_the_readings_the_overlay_draws(self):
+        result = display_temperatures({"nozzle": 219.5, "nozzle_target": 220.0, "bed": 60.0, "bed_target": 60.0}, "X1C")
+        assert result == {"nozzle": 219.5, "nozzle_target": 220.0, "bed": 60.0, "bed_target": 60.0}
+
+    def test_drops_heater_flags_and_private_bookkeeping(self):
+        result = display_temperatures(
+            {
+                "nozzle": 219.5,
+                "nozzle_heating": True,
+                "bed_heating": False,
+                "_nozzle_target_set_time": 1754300000.0,
+                "_chamber_target_set_time": 1754300000.0,
+            },
+            "X1C",
+        )
+        assert result == {"nozzle": 219.5}
+
+    def test_chamber_kept_on_models_with_a_real_sensor(self):
+        result = display_temperatures({"chamber": 38.0, "chamber_target": 40.0}, "X1C")
+        assert result == {"chamber": 38.0, "chamber_target": 40.0}
+
+    def test_chamber_dropped_on_models_without_one(self):
+        """P1P, P1S, A1 and A1 mini publish a meaningless chamber_temper. Drawing
+        it on a live stream would state a measurement that doesn't exist."""
+        for model in ("P1S", "P1P", "A1", "A1MINI"):
+            assert display_temperatures({"nozzle": 200.0, "chamber": 38.0}, model) == {"nozzle": 200.0}
+
+    def test_second_nozzle_is_included(self):
+        result = display_temperatures({"nozzle": 220.0, "nozzle_2": 240.0, "nozzle_2_target": 250.0}, "H2D")
+        assert result == {"nozzle": 220.0, "nozzle_2": 240.0, "nozzle_2_target": 250.0}
+
+    def test_unparseable_and_missing_values_are_skipped(self):
+        """A reading that isn't a number is dropped rather than crashing the
+        feed or reaching the page as a string."""
+        assert display_temperatures({"nozzle": None, "bed": "warm", "chamber": 38.0}, "X1C") == {"chamber": 38.0}
+
+    def test_empty_and_none_are_empty(self):
+        assert display_temperatures(None, "X1C") == {}
+        assert display_temperatures({}, "X1C") == {}
+
+
 class TestSupportsChamberTemp:
     """Tests for supports_chamber_temp helper function."""
 
@@ -1359,17 +1749,21 @@ class TestSupportsDrying:
     def test_known_supported_with_firmware(self):
         """Verify known models with sufficient firmware return True."""
         assert supports_drying("X1C", "01.09.00.00") is True
-        assert supports_drying("P1S", "01.08.00.00") is True
         assert supports_drying("H2D", "01.02.30.00") is True
         assert supports_drying("H2S", "01.02.00.00") is True
+        assert supports_drying("H2C", "01.02.00.00") is True
+        assert supports_drying("O1C", "01.02.00.00") is True
+        assert supports_drying("O1C2", "01.02.00.00") is True
         assert supports_drying("P2S", "01.02.00.00") is True
         assert supports_drying("N7", "01.02.00.00") is True
 
     def test_known_supported_old_firmware(self):
         """Verify known models with old firmware return False."""
         assert supports_drying("X1C", "01.08.00.00") is False
-        assert supports_drying("P1S", "01.07.00.00") is False
         assert supports_drying("H2S", "01.01.00.00") is False
+        assert supports_drying("H2C", "01.01.99.99") is False
+        assert supports_drying("O1C", "01.01.99.99") is False
+        assert supports_drying("O1C2", "01.01.99.99") is False
         assert supports_drying("P2S", "01.01.99.99") is False
         assert supports_drying("N7", "01.01.99.99") is False
 
@@ -1380,7 +1774,7 @@ class TestSupportsDrying:
 
     def test_unsupported_models(self):
         """Verify models without AMS drying support return False regardless of firmware."""
-        for model in ["A1", "A1MINI", "A1-MINI", "H2C", "N1", "N2S"]:
+        for model in ["A1", "A1MINI", "A1-MINI", "N1", "N2S"]:
             assert supports_drying(model, "99.99.99.99") is False, f"Expected False for {model}"
 
     def test_unknown_models_allowed(self):
@@ -1406,6 +1800,117 @@ class TestSupportsDrying:
         assert supports_drying("x1c", "01.09.00.00") is True
         assert supports_drying("p2s", "01.02.00.00") is True
         assert supports_drying("a1", "99.99.99.99") is False
+
+
+class TestDryingScreenOnly:
+    """P1-series AMS drying is screen-only (#2533).
+
+    Bambu's P1 manual: "P1S connected AMS drying functions may only be controlled
+    from the P1S screen." The firmware acks `ams_filament_drying` with
+    result: success and then does nothing — so no command we send can ever start a
+    cycle, whatever the firmware version.
+    """
+
+    @pytest.mark.parametrize("model", ["P1S", "P1P", "p1s", " p1p "])
+    def test_screen_only_models_reject_remote_drying(self, model):
+        assert drying_screen_only(model) is True
+        # Not firmware-gated: even the newest firmware won't take the command.
+        assert supports_drying(model, "99.99.99.99") is False
+
+    @pytest.mark.parametrize("model", ["X1C", "P2S", "H2D", "A1", None])
+    def test_other_models_are_not_screen_only(self, model):
+        assert drying_screen_only(model) is False
+
+    def test_screen_only_is_not_the_same_as_unsupported(self):
+        # The A1 has no drying-capable AMS at all; the P1S does, it just can't be
+        # driven remotely. The UI needs to tell those two apart.
+        assert drying_screen_only("A1") is False
+        assert supports_drying("A1", "99.99.99.99") is False
+
+
+class TestSupportsDryingWhilePrinting:
+    """Tests for the supports_drying_while_printing gate (concurrent drying during print).
+
+    Stricter than supports_drying — only models explicitly confirmed by Bambu wiki
+    release notes are allowed (verified phrase: "printing while filament is drying"
+    / "Print While Drying").
+    """
+
+    def test_known_supported_with_firmware(self):
+        """Matrix-confirmed models with min firmware return True."""
+        assert supports_drying_while_printing("H2D", "01.03.00.00") is True
+        assert supports_drying_while_printing("H2D Pro", "01.02.00.00") is True
+        assert supports_drying_while_printing("O1E", "01.02.00.00") is True
+        assert supports_drying_while_printing("O2D", "01.02.00.00") is True
+        assert supports_drying_while_printing("H2C", "01.02.00.00") is True
+        assert supports_drying_while_printing("O1C", "01.02.00.00") is True
+        assert supports_drying_while_printing("O1C2", "01.02.00.00") is True
+        assert supports_drying_while_printing("H2S", "01.02.00.00") is True
+        assert supports_drying_while_printing("X2D", "01.01.00.00") is True
+        assert supports_drying_while_printing("N6", "01.01.00.00") is True
+        assert supports_drying_while_printing("X1C", "01.11.02.00") is True
+        assert supports_drying_while_printing("BL-P001", "01.11.02.00") is True
+        assert supports_drying_while_printing("P2S", "01.02.00.00") is True
+        assert supports_drying_while_printing("N7", "01.02.00.00") is True
+        assert supports_drying_while_printing("A2L", "01.01.00.00") is True
+        assert supports_drying_while_printing("N9", "01.01.00.00") is True
+
+    def test_known_supported_below_min_firmware(self):
+        """Matrix-confirmed models on too-old firmware return False."""
+        assert supports_drying_while_printing("H2D", "01.02.30.00") is False
+        assert supports_drying_while_printing("X1C", "01.11.01.00") is False
+        assert supports_drying_while_printing("P2S", "01.01.99.99") is False
+        assert supports_drying_while_printing("H2S", "01.01.99.99") is False
+        assert supports_drying_while_printing("A2L", "01.00.99.99") is False
+
+    def test_not_in_matrix_excluded(self):
+        """Models absent from the matrix return False regardless of firmware.
+
+        P1*, A1, A1 Mini, X1 (non-C), X1E are intentionally excluded — their wiki
+        release notes never mention "Print While Drying" / "printing while filament
+        is drying".
+        """
+        for model in [
+            "P1P",
+            "P1S",
+            "C11",
+            "C12",
+            "A1",
+            "A1 MINI",
+            "A1MINI",
+            "N1",
+            "N2S",
+            "X1",
+            "X1E",
+            "BL-P002",
+            "C13",
+        ]:
+            assert supports_drying_while_printing(model, "99.99.99.99") is False, f"Expected False for {model}"
+
+    def test_no_firmware_returns_false(self):
+        """Missing firmware version returns False even for supported models."""
+        assert supports_drying_while_printing("H2D", None) is False
+        assert supports_drying_while_printing("P2S", None) is False
+
+    def test_none_model_returns_false(self):
+        """None model returns False."""
+        assert supports_drying_while_printing(None, "01.03.00.00") is False
+
+    def test_case_insensitive(self):
+        """Model matching is case-insensitive."""
+        assert supports_drying_while_printing("h2d", "01.03.00.00") is True
+        assert supports_drying_while_printing("p2s", "01.02.00.00") is True
+        assert supports_drying_while_printing("a1", "99.99.99.99") is False
+
+    def test_unknown_model_returns_false(self):
+        """Unknown models default to FALSE (strict gate — not the lenient default-allow).
+
+        This contrasts with supports_drying which defaults to True for unknown
+        models. For while-printing the cost of being wrong is real (firmware
+        rejection mid-print is annoying; melted spool is worse), so we err
+        toward conservative.
+        """
+        assert supports_drying_while_printing("FUTURE_MODEL", "99.99.99.99") is False
 
 
 class TestGetDerivedStatusName:
@@ -1556,6 +2061,37 @@ class TestInitPrinterConnections:
             await init_printer_connections(mock_db)
 
             mock_manager.connect_printer.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_one_failing_printer_does_not_abort_the_rest(self):
+        """A single unreachable printer must not abort startup or the others (#2572).
+
+        The connections are gathered with return_exceptions=True. The old serial
+        ``await`` loop had no error handling, so the first printer that raised
+        propagated straight out of init_printer_connections and failed the
+        FastAPI lifespan — taking the whole app down over one bad row, and
+        skipping every printer after it. This asserts the isolation: every
+        printer is still attempted and the exception never escapes.
+        """
+        mock_db = AsyncMock()
+        printers = [MagicMock(id=i, name=f"p{i}", is_active=True) for i in range(3)]
+        mock_result = MagicMock()
+        mock_result.scalars.return_value.all.return_value = printers
+        mock_db.execute.return_value = mock_result
+
+        async def connect(printer):
+            if printer.id == 1:
+                raise ConnectionError("printer 1 is unreachable")
+            return True
+
+        with patch("backend.app.services.printer_manager.printer_manager") as mock_manager:
+            mock_manager.connect_printer = AsyncMock(side_effect=connect)
+
+            # Must not raise despite printer 1 failing.
+            await init_printer_connections(mock_db)
+
+            # All three were still attempted (not aborted at the failing one).
+            assert mock_manager.connect_printer.call_count == 3
 
 
 class TestAmsChangeCallback:

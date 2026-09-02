@@ -42,7 +42,10 @@ jobs:
           python-version: ${{ env.PYTHON_VERSION }}
 
       - name: Install ruff
-        run: pip install ruff
+        # Install the exact pin from requirements-dev.txt rather than the latest
+        # release, so CI and contributors run the same linter. `pip install ruff`
+        # silently drifted ahead of every local venv.
+        run: pip install "$(grep -E '^ruff==' requirements-dev.txt)"
 
       - name: Run ruff check
         run: ruff check backend/
@@ -65,7 +68,10 @@ jobs:
 
       - name: Install dependencies
         run: |
-          python -m pip install --upgrade pip
+          # Upgrade setuptools too: the runner's Python toolcache ships an old
+          # setuptools that trips pip-audit (PYSEC-2026-3447, fixed in 83.0.0).
+          # A fix exists, so we upgrade rather than --ignore-vuln.
+          python -m pip install --upgrade pip setuptools
           pip install -r requirements.txt
           pip install pip-audit
 
@@ -195,15 +201,47 @@ jobs:
               if path and not info.get('dev') and not info.get('devOptional'):
                   prod.add(path.split('node_modules/')[-1])
           vulns = data.get('vulnerabilities', {})
+          # Documented advisory exceptions: high/critical findings whose only offered
+          # 'fix' is a semver-major change and which do not apply to how Bambuddy ships.
+          # Keyed by GHSA id. An entry only holds while the fix stays major-only (see
+          # fix_is_major below) - once upstream backports, the gate fails until we take
+          # the patch. That is what retired the one entry this list used to carry:
+          # GHSA-qwww-vcr4-c8h2 (React Router RSC-mode CSRF) shipped in 7.18.2, so the
+          # pin moved rather than the exception staying.
+          ALLOWLIST = set()
+          def advisory_ids(name, seen=None):
+              seen = seen if seen is not None else set()
+              if name in seen:
+                  return set()
+              seen.add(name)
+              ids = set()
+              for item in vulns.get(name, {}).get('via', []):
+                  if isinstance(item, dict):
+                      url = item.get('url', '')
+                      if '/advisories/' in url:
+                          ids.add(url.rsplit('/', 1)[-1])
+                  elif isinstance(item, str):
+                      ids |= advisory_ids(item, seen)
+              return ids
+          def fix_is_major(v):
+              fa = v.get('fixAvailable')
+              return isinstance(fa, dict) and fa.get('isSemVerMajor')
+          def exempt(name, v):
+              ids = advisory_ids(name)
+              return bool(ids) and ids <= ALLOWLIST and fix_is_major(v)
           fixable = {n: v for n, v in vulns.items()
-                     if n in prod and v.get('severity') in ('high', 'critical') and v.get('fixAvailable')}
+                     if n in prod and v.get('severity') in ('high', 'critical')
+                     and v.get('fixAvailable') and not exempt(n, v)}
           skipped = len(vulns) - len({n: v for n, v in vulns.items() if n in prod})
           if fixable:
               for name, v in fixable.items():
                   print(f'FIXABLE {v[\"severity\"].upper()}: {name}')
               sys.exit(1)
           total = sum(1 for n, v in vulns.items() if n in prod and v.get('severity') in ('high', 'critical'))
+          exempted = sorted(n for n, v in vulns.items() if n in prod and exempt(n, v))
           print(f'npm audit: {total} high/critical (0 fixable), {len(vulns)} total ({skipped} npm-internal filtered)')
+          if exempted:
+              print('exempted (documented, unreachable): ' + ', '.join(exempted))
           "
 
   frontend-typecheck:

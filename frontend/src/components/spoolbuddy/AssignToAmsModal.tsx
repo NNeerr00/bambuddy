@@ -7,6 +7,7 @@ import { ConfirmModal } from '../ConfirmModal';
 import { AmsUnitCard, NozzleBadge } from './AmsUnitCard';
 import type { AmsThresholds } from './AmsUnitCard';
 import { getFillBarColor } from '../../utils/amsHelpers';
+import { getSwatchStyle } from '../../utils/colors';
 
 function getAmsName(id: number): string {
   if (id <= 3) return `AMS ${String.fromCharCode(65 + id)}`;
@@ -65,8 +66,13 @@ export function AssignToAmsModal({ isOpen, onClose, spool, printerId, spoolmanMo
   const [statusMessage, setStatusMessage] = useState<string | null>(null);
   const [statusType, setStatusType] = useState<'info' | 'success' | 'error' | null>(null);
   const [showMismatchConfirm, setShowMismatchConfirm] = useState(false);
+  // Profile-only mismatches no longer trigger the popup — the backend
+  // pushes the spool's slicer profile to the AMS slot on every assign
+  // anyway, so the warning was friction without benefit (#1552). Material
+  // mismatch still warns because firmware can refuse a print when type
+  // doesn't match.
   const [mismatchDetails, setMismatchDetails] = useState<{
-    type: 'material' | 'partial' | 'profile' | 'material_profile' | 'partial_profile';
+    type: 'material' | 'partial' | 'material_profile' | 'partial_profile';
     spoolMaterial: string;
     trayMaterial: string;
     spoolProfile?: string;
@@ -170,13 +176,21 @@ export function AssignToAmsModal({ isOpen, onClose, spool, printerId, spoolmanMo
     ? status.ams_extruder_map
     : cachedAmsExtruderMap.current;
 
+  const ftsInstalled = status?.fila_switch?.installed === true;
+
   const getNozzleSide = useCallback((amsId: number): 'L' | 'R' | null => {
     if (!isDualNozzle) return null;
     const mappedExtruderId = amsExtruderMap[String(amsId)];
+    if (mappedExtruderId !== undefined) return mappedExtruderId === 1 ? 'L' : 'R';
+    // With a Filament Track Switch every AMS reports extruder 0xE and reaches
+    // both nozzles through the switch, so there is no side to show. The unit-id
+    // guess below would label them all "R" — it exists only for dual-nozzle
+    // printers that never sent a map at all. See PrintersPage.amsSideBadge,
+    // which shows the switch inlet in place of L/R on the printer card.
+    if (ftsInstalled) return null;
     const normalizedId = amsId >= 128 ? amsId - 128 : amsId;
-    const extruderId = mappedExtruderId !== undefined ? mappedExtruderId : normalizedId;
-    return extruderId === 1 ? 'L' : 'R';
-  }, [isDualNozzle, amsExtruderMap]);
+    return normalizedId === 1 ? 'L' : 'R';
+  }, [isDualNozzle, amsExtruderMap, ftsInstalled]);
 
   // Assign spool to AMS slot — single API call, backend handles both DB record
   // AND MQTT auto-configuration. When the target slot is currently empty, the
@@ -265,15 +279,15 @@ export function AssignToAmsModal({ isOpen, onClose, spool, printerId, spoolmanMo
         const trayProfile = tray.tray_type || '';
         const profileMatches = checkProfileMatch(spoolProfile, trayProfile);
 
-        if (materialMatchResult !== 'exact' || !profileMatches) {
-          let mismatchType: 'material' | 'partial' | 'profile' | 'material_profile' | 'partial_profile' = 'profile';
+        if (materialMatchResult !== 'exact') {
+          let mismatchType: 'material' | 'partial' | 'material_profile' | 'partial_profile';
           if (materialMatchResult === 'none' && !profileMatches) {
             mismatchType = 'material_profile';
           } else if (materialMatchResult === 'partial' && !profileMatches) {
             mismatchType = 'partial_profile';
           } else if (materialMatchResult === 'none') {
             mismatchType = 'material';
-          } else if (materialMatchResult === 'partial') {
+          } else {
             mismatchType = 'partial';
           }
 
@@ -352,7 +366,7 @@ export function AssignToAmsModal({ isOpen, onClose, spool, printerId, spoolmanMo
 
   if (!isOpen) return null;
 
-  const colorHex = spool.rgba ? `#${spool.rgba.slice(0, 6)}` : '#808080';
+  const colorStyle = getSwatchStyle(spool.rgba);
 
   return (
     <>
@@ -360,7 +374,7 @@ export function AssignToAmsModal({ isOpen, onClose, spool, printerId, spoolmanMo
       {/* Header */}
       <div className="flex items-center justify-between px-5 py-3 border-b border-zinc-800 shrink-0">
         <div className="flex items-center gap-3 min-w-0">
-          <div className="w-7 h-7 rounded-full shrink-0" style={{ backgroundColor: colorHex }} />
+          <div className="w-7 h-7 rounded-full shrink-0" style={colorStyle} />
           <div className="min-w-0">
             <h2 className="text-sm font-semibold text-zinc-100 truncate">
               {t('spoolbuddy.modal.assignToAmsTitle', 'Assign to AMS')}
@@ -541,13 +555,12 @@ export function AssignToAmsModal({ isOpen, onClose, spool, printerId, spoolmanMo
           trayProfile: mismatchDetails.trayProfile || t('common.unknown'),
           location: mismatchDetails.location,
         })}`;
-      } else if (mismatchDetails.type === 'profile') {
-        message = t('inventory.assignProfileMismatchMessage', {
-          spoolProfile: mismatchDetails.spoolProfile || t('common.unknown'),
-          trayProfile: mismatchDetails.trayProfile || t('common.unknown'),
-          location: mismatchDetails.location,
-        });
       }
+
+      // Always tell the user the AMS slot will be reconfigured — without
+      // this, "Assign Anyway" reads as a no-op confirmation when the
+      // backend in fact pushes the spool profile on every assign (#1552).
+      message = `${message}\n\n${t('inventory.assignReconfigureNote')}`;
 
       return (
         <ConfirmModal

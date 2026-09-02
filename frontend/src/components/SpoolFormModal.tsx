@@ -3,25 +3,37 @@ import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import { X, Loader2, Save, Beaker, Palette, Zap, Tag, Unlink } from 'lucide-react';
 import { api, ApiError } from '../api/client';
-import type { InventorySpool, SlicerSetting, SpoolCatalogEntry, LocalPreset, BuiltinFilament, SpoolmanBulkCreateResult, SpoolKProfileInput, SpoolmanFilamentEntry } from '../api/client';
+import type { InventorySpool, SlicerSetting, SpoolCatalogEntry, LocalPreset, BuiltinFilament, SpoolmanBulkCreateResult, SpoolFilamentPresetInput, SpoolKProfileInput, SpoolmanFilamentEntry } from '../api/client';
 import { Button } from './Button';
 import { useToast } from '../contexts/ToastContext';
-import type { SpoolFormData, PrinterWithCalibrations, ColorPreset } from './spool-form/types';
+import type {
+  CalibrationProfile,
+  ColorPreset,
+  PresetChoice,
+  PrinterWithCalibrations,
+  SpoolFormData,
+  SpoolFormMode,
+} from './spool-form/types';
 import { defaultFormData, validateForm, SPOOLMAN_LINKED_FIELDS } from './spool-form/types';
-import { buildFilamentOptions, extractBrandsFromPresets, findPresetOption, loadRecentColors, parsePresetName, saveRecentColor } from './spool-form/utils';
+import { buildFilamentOptions, extractBrandsFromPresets, fetchPrinterCalibrations, findPresetOption, hotendKey, loadRecentColors, pairedOptions, parsePresetKey, parsePresetName, presetKey, saveRecentColor, withCurrentValue } from './spool-form/utils';
 import { MATERIALS } from './spool-form/constants';
 import { FilamentSection } from './spool-form/FilamentSection';
 import { ColorSection } from './spool-form/ColorSection';
 import { AdditionalSection } from './spool-form/AdditionalSection';
 import { SpoolmanFilamentPicker } from './spool-form/SpoolmanFilamentPicker';
-import { PAProfileSection } from './spool-form/PAProfileSection';
+import { PrinterProfilesSection } from './spool-form/PrinterProfilesSection';
+import { normaliseFlow } from '../utils/nozzleFlow';
 import { SpoolUsageHistory } from './SpoolUsageHistory';
+import {
+  invalidateInventoryLocations,
+  invalidateSpoolAndLocationQueries,
+} from '../utils/inventoryQueries';
 
-type TabId = 'filament' | 'pa-profile';
+type TabId = 'filament' | 'appearance' | 'printers';
 
 const CLEAR_TAG_PAYLOAD = { tag_uid: null, tray_uuid: null, tag_type: null, data_origin: null };
 
-export type SpoolFormMode = 'create' | 'edit' | 'copy';
+export type { SpoolFormMode };
 
 interface SpoolFormModalProps {
   isOpen: boolean;
@@ -52,6 +64,9 @@ export function SpoolFormModal({
   const queryClient = useQueryClient();
   const { showToast } = useToast();
 
+  const refreshSpoolQueries = () =>
+    invalidateSpoolAndLocationQueries(queryClient, spoolsQueryKey);
+
   const isEditing = mode === 'edit';
   const isCopying = mode === 'copy';
 
@@ -60,7 +75,7 @@ export function SpoolFormModal({
   const [errors, setErrors] = useState<Partial<Record<keyof SpoolFormData, string>>>({});
   const [activeTab, setActiveTab] = useState<TabId>('filament');
   const [weightTouched, setWeightTouched] = useState(false);
-  const [storageLocationTouched, setStorageLocationTouched] = useState(false);
+  const [locationIdTouched, setLocationIdTouched] = useState(false);
   const [quickAdd, setQuickAdd] = useState(false);
   const [quantity, setQuantity] = useState(1);
 
@@ -68,10 +83,12 @@ export function SpoolFormModal({
   const [cloudAuthenticated, setCloudAuthenticated] = useState(false);
   const [loadingCloudPresets, setLoadingCloudPresets] = useState(false);
   const [cloudPresets, setCloudPresets] = useState<SlicerSetting[]>([]);
+  const [orcaSettingIds, setOrcaSettingIds] = useState<Set<string>>(new Set());
   const [presetInputValue, setPresetInputValue] = useState('');
 
   // Spool catalog
   const [spoolCatalog, setSpoolCatalog] = useState<SpoolCatalogEntry[]>([]);
+  const [storageLocations, setStorageLocations] = useState<{ id: number; name: string }[]>([]);
 
   // Local presets (OrcaSlicer imports)
   const [localPresets, setLocalPresets] = useState<LocalPreset[]>([]);
@@ -96,16 +113,31 @@ export function SpoolFormModal({
 
   // PA Profile state
   const [fetchedCalibrations, setFetchedCalibrations] = useState<PrinterWithCalibrations[]>([]);
-  const [selectedProfiles, setSelectedProfiles] = useState<Set<string>>(new Set());
-  const [expandedPrinters, setExpandedPrinters] = useState<Set<string>>(new Set());
+  // Whether the calibration fetch above is still running. Without it the
+  // Printers tab renders its "no printers configured" empty state while the
+  // printers are still being asked -- which reads as a wrong answer rather
+  // than as a wait, and the fetch is several round trips per machine.
+  const [loadingCalibrations, setLoadingCalibrations] = useState(false);
+  // One K profile per hotend, keyed `printerId:extruder:diameter`. A Map rather
+  // than a Set of composite keys because the Printers tab presents each hotend
+  // as a single-choice dropdown -- the shape makes "two profiles for one
+  // hotend" unrepresentable instead of relying on eviction logic to prevent it.
+  const [selectedProfiles, setSelectedProfiles] = useState<Map<string, CalibrationProfile>>(new Map());
+  // Per-printer-model preset overrides, keyed by `presetKey(model, diameter)`.
+  // Only the models the user has actually overridden are present; an absent
+  // entry means "inherit this spool's own preset", which is exactly what the
+  // backend cascade does with a missing row.
+  const [modelPresets, setModelPresets] = useState<Map<string, PresetChoice>>(new Map());
+  const [selectedGroupId, setSelectedGroupId] = useState<string>('');
 
   // Use prop if provided, otherwise use self-fetched data
   const resolvedCalibrations = printersWithCalibrations.length > 0
     ? printersWithCalibrations
     : fetchedCalibrations;
 
-  // Count selected PA profiles for tab badge
-  const selectedProfileCount = selectedProfiles.size;
+  // Tab badge: everything the user has configured under Printers, K profiles
+  // and preset overrides alike, since both live on that tab now.
+  const selectedProfileCount = selectedProfiles.size + modelPresets.size;
 
   // Fetch Spoolman filament catalog when in Spoolman mode
   // retry:false — Spoolman may be intentionally disabled (400); don't flood the server
@@ -122,23 +154,55 @@ export function SpoolFormModal({
     setRecentColors(loadRecentColors());
   }, []);
 
-  // Fetch cloud presets and catalog when modal opens
+  // Fetch cloud presets and catalog when modal opens. Fetches Bambu Cloud
+  // and Orca Cloud in parallel; merges Orca filaments into ``cloudPresets``
+  // since ``OrcaProfileMeta`` is structurally identical to ``SlicerSetting``
+  // (same fields, same semantics). ``cloudAuthenticated`` flips on if either
+  // cloud is connected — the UI only uses it to gate "no cloud" hints.
   useEffect(() => {
+    // ``cancelled`` gates every state setter so a fetch that resolves AFTER
+    // the modal closes / unmounts can't fire setState on a torn-down
+    // component. Without this guard the parallel Promise.allSettled chain
+    // can still hit ``setLoadingCloudPresets(false)`` in its ``finally``
+    // after vitest has dismantled the JSDOM window — surfaced as an
+    // "Unhandled Rejection: window is not defined" in CI runs.
+    let cancelled = false;
     if (isOpen) {
       const fetchData = async () => {
         setLoadingCloudPresets(true);
         try {
-          const status = await api.getCloudStatus();
-          setCloudAuthenticated(status.is_authenticated);
-          if (status.is_authenticated) {
-            const presets = await api.getFilamentPresets();
-            setCloudPresets(presets);
-          }
+          const [bambuResult, orcaResult] = await Promise.allSettled([
+            (async () => {
+              const status = await api.getCloudStatus();
+              if (!status.is_authenticated) return { connected: false, presets: [] as SlicerSetting[] };
+              const presets = await api.getFilamentPresets();
+              return { connected: true, presets };
+            })(),
+            (async () => {
+              const status = await api.orcaCloudStatus();
+              if (!status.connected) return { connected: false, presets: [] as SlicerSetting[] };
+              const list = await api.orcaCloudListProfiles();
+              // OrcaProfileMeta is structurally identical to SlicerSetting.
+              return { connected: true, presets: list.filament as unknown as SlicerSetting[] };
+            })(),
+          ]);
+          if (cancelled) return;
+          const bambuConnected = bambuResult.status === 'fulfilled' && bambuResult.value.connected;
+          const orcaConnected = orcaResult.status === 'fulfilled' && orcaResult.value.connected;
+          const bambuPresets = bambuResult.status === 'fulfilled' ? bambuResult.value.presets : [];
+          const orcaPresets = orcaResult.status === 'fulfilled' ? orcaResult.value.presets : [];
+          setCloudAuthenticated(bambuConnected || orcaConnected);
+          setCloudPresets([...bambuPresets, ...orcaPresets]);
+          // The two clouds are merged into one list, so remember which ids came
+          // from Orca -- it is the only way the origin badge can tell them
+          // apart afterwards.
+          setOrcaSettingIds(new Set(orcaPresets.map(p => p.setting_id)));
         } catch (e) {
+          if (cancelled) return;
           console.error('Failed to fetch cloud presets:', e);
           setCloudAuthenticated(false);
         } finally {
-          setLoadingCloudPresets(false);
+          if (!cancelled) setLoadingCloudPresets(false);
         }
       };
       fetchData();
@@ -148,43 +212,45 @@ export function SpoolFormModal({
       api.getColorCatalog().then(setColorCatalog).catch(console.error);
       api.getLocalPresets().then(r => setLocalPresets(r.filament)).catch(console.error);
       api.getBuiltinFilaments().then(setBuiltinFilaments).catch(console.error);
+      api.getLocations().then((locs) => setStorageLocations(locs.map((l) => ({ id: l.id, name: l.name })))).catch(console.error);
 
       // Fetch printer calibrations if not provided via props
       if (printersWithCalibrations.length === 0) {
         (async () => {
+          setLoadingCalibrations(true);
           try {
             const printers = await api.getPrinters();
             const statuses = await Promise.all(
               printers.map(p => api.getPrinterStatus(p.id).catch(() => null)),
             );
-            const results: PrinterWithCalibrations[] = [];
-            for (let i = 0; i < printers.length; i++) {
-              const printer = printers[i];
-              const status = statuses[i];
-              const connected = status?.connected ?? false;
-              let calibrations: PrinterWithCalibrations['calibrations'] = [];
-              if (connected) {
-                try {
-                  const kRes = await api.getKProfiles(printer.id);
-                  calibrations = kRes.profiles.map(p => ({
-                    cali_idx: p.slot_id,
-                    filament_id: p.filament_id,
-                    setting_id: p.setting_id || '',
-                    name: p.name,
-                    k_value: parseFloat(p.k_value) || 0,
-                    n_coef: parseFloat(p.n_coef) || 0,
-                    extruder_id: p.extruder_id,
-                    nozzle_diameter: p.nozzle_diameter,
-                  }));
-                } catch {
-                  // Printer may not support K-profiles
+            // Printers in parallel, diameters within a printer in series.
+            // Separate machines are separate MQTT connections and do not
+            // interfere; it is one printer's own firmware that drops a
+            // concurrent burst of calibration requests (see
+            // fetchPrinterCalibrations). Walking the fleet one machine at a
+            // time made the whole tab wait for the sum of every printer.
+            const results = await Promise.all(
+              printers.map(async (printer, i) => {
+                const status = statuses[i];
+                const connected = status?.connected ?? false;
+                let calibrations: PrinterWithCalibrations['calibrations'] = [];
+                if (connected) {
+                  // Across every nozzle size, so a profile for a size that is
+                  // not currently fitted is still offered (#2618 fetched only
+                  // the fitted ones).
+                  calibrations = await fetchPrinterCalibrations(printer.id, status);
                 }
-              }
-              results.push({ printer: { ...printer, connected }, calibrations });
-            }
-            setFetchedCalibrations(results);
+                // Keep the reported nozzle hardware: the Printers tab lists a
+                // model's installed diameters from it. Read as a set of
+                // diameters only -- never indexed by extruder.
+                return { printer: { ...printer, connected }, calibrations, nozzles: status?.nozzles };
+              }),
+            );
+            if (!cancelled) setFetchedCalibrations(results);
           } catch (e) {
             console.error('Failed to fetch printer calibrations:', e);
+          } finally {
+            if (!cancelled) setLoadingCalibrations(false);
           }
         })();
       }
@@ -195,13 +261,16 @@ export function SpoolFormModal({
     // "test environment was torn down" errors in vitest. spoolmanMode only
     // gates a single fetch (getSpoolCatalog) which is cheap enough to skip
     // when the modal opens in Spoolman mode.
+    return () => {
+      cancelled = true;
+    };
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [isOpen, printersWithCalibrations.length]);
 
   // Build filament options: cloud → local → fallback
   const filamentOptions = useMemo(
-    () => buildFilamentOptions(cloudPresets, new Set(), localPresets, builtinFilaments),
-    [cloudPresets, localPresets, builtinFilaments],
+    () => buildFilamentOptions(cloudPresets, new Set(), localPresets, builtinFilaments, orcaSettingIds),
+    [cloudPresets, localPresets, builtinFilaments, orcaSettingIds],
   );
 
   // Extract brands from presets
@@ -272,21 +341,33 @@ export function SpoolFormModal({
     return map;
   }, [brandMaterialPairs]);
 
-  const availableBrands = useMemo(() => {
-    if (!formData.material) return baseAvailableBrands;
-    const materialKey = formData.material.toLowerCase();
-    const brandKeys = materialToBrands.get(materialKey);
-    if (!brandKeys || brandKeys.size === 0) return baseAvailableBrands;
-    return baseAvailableBrands.filter(brand => brandKeys.has(brand.toLowerCase()));
-  }, [baseAvailableBrands, formData.material, materialToBrands]);
+  // #1905: the brand and material dropdowns used to be filtered down to the
+  // pairs seen in the color catalog / slicer presets, which hid perfectly valid
+  // combinations — "Elegoo" exists (as a PLA brand) but vanished from the list
+  // once ASA was selected, making the entry look impossible. Both lists now
+  // always offer everything we know about, plus whatever the spool already has
+  // stored (a custom brand saved earlier was missing from its own dropdown).
+  // The pairing knowledge survives as `suggestedBrands`/`suggestedMaterials`,
+  // which the dropdowns sort to the top instead of filtering by.
+  const availableBrands = useMemo(
+    () => withCurrentValue(baseAvailableBrands, formData.brand),
+    [baseAvailableBrands, formData.brand],
+  );
 
-  const availableMaterials = useMemo(() => {
-    if (!formData.brand) return baseAvailableMaterials;
-    const brandKey = formData.brand.toLowerCase();
-    const materialKeys = brandToMaterials.get(brandKey);
-    if (!materialKeys || materialKeys.size === 0) return baseAvailableMaterials;
-    return baseAvailableMaterials.filter(material => materialKeys.has(material.toLowerCase()));
-  }, [baseAvailableMaterials, formData.brand, brandToMaterials]);
+  const availableMaterials = useMemo(
+    () => withCurrentValue(baseAvailableMaterials, formData.material),
+    [baseAvailableMaterials, formData.material],
+  );
+
+  const suggestedBrands = useMemo(
+    () => pairedOptions(availableBrands, formData.material, materialToBrands),
+    [availableBrands, formData.material, materialToBrands],
+  );
+
+  const suggestedMaterials = useMemo(
+    () => pairedOptions(availableMaterials, formData.brand, brandToMaterials),
+    [availableMaterials, formData.brand, brandToMaterials],
+  );
 
   // Find selected preset option
   const selectedPresetOption = useMemo(
@@ -329,43 +410,108 @@ export function SpoolFormModal({
           cost_per_kg: spool.cost_per_kg ?? null,
           category: spool.category || '',
           low_stock_threshold_pct: spool.low_stock_threshold_pct ?? null,
-          storage_location: spool.storage_location || '',
+          location_id: spool.location_id ?? null,
           spoolman_filament_id: null,
         });
         setPresetInputValue(spool.slicer_filament_name || spool.slicer_filament || '');
 
-        // Load K-profiles for this spool
+        // Load K-profiles for this spool. The stored row carries everything
+        // the picker needs to show the selection before the printer answers,
+        // so an offline printer still renders what was chosen for it.
         if (spool.k_profiles && spool.k_profiles.length > 0) {
-          const profileKeys = new Set<string>();
+          const chosen = new Map<string, CalibrationProfile>();
           for (const p of spool.k_profiles) {
-            if (p.cali_idx !== null && p.cali_idx !== undefined) {
-              profileKeys.add(`${p.printer_id}:${p.cali_idx}:${p.extruder ?? 'null'}`);
-            }
+            if (p.cali_idx === null || p.cali_idx === undefined) continue;
+            const diameter = (p.nozzle_diameter || '').trim() || '0.4';
+            const extruder = p.extruder ?? 0;
+            chosen.set(hotendKey(p.printer_id, extruder, diameter), {
+              cali_idx: p.cali_idx,
+              filament_id: '',
+              setting_id: p.setting_id || '',
+              name: p.name || '',
+              k_value: p.k_value,
+              n_coef: 0,
+              extruder_id: extruder,
+              nozzle_diameter: diameter,
+              // Stored as the bare flow code; the picker re-derives its label
+              // from the same field it reads off a live profile.
+              nozzle_id: p.nozzle_type || '',
+            });
           }
-          setSelectedProfiles(profileKeys);
+          setSelectedProfiles(chosen);
         } else {
-          setSelectedProfiles(new Set());
+          setSelectedProfiles(new Map());
         }
       } else {
         setFormData(defaultFormData);
         setPresetInputValue('');
-        setSelectedProfiles(new Set());
-        setQuickAdd(false);
-        setQuantity(1);
+        setSelectedProfiles(new Map());
       }
+      // Reset on every open, not just the create path (#1905). The modal keeps
+      // its state while closed, and the Quick Add toggle only renders in create
+      // mode — so quick-adding a spool and then opening Edit left the edit form
+      // stuck in quick-add layout (no preset field, no PA-profile tab) with no
+      // control to switch back.
+      setQuickAdd(false);
+      setQuantity(1);
       setErrors({});
       setActiveTab('filament');
+      setSelectedGroupId('');
+      // Cleared on every open, both branches: the modal keeps its state while
+      // closed, so editing spool B after spool A would otherwise show (and
+      // save) A's per-model overrides on B. Refilled by the fetch below.
+      setModelPresets(new Map());
       setWeightTouched(false);
-      setStorageLocationTouched(false);
+      setLocationIdTouched(false);
     }
   }, [isOpen, spool, mode, isCopying]);
 
-  // Expand all printers in PA profile section when calibrations are available
+  // Load this spool's per-printer-model preset overrides. Fetched rather than
+  // read off the spool: they are deliberately not embedded in the spool
+  // response, which the inventory list returns once per spool the user owns.
+  // Copying a spool copies its overrides -- they describe the filament on the
+  // spool, which is what a copy has too.
   useEffect(() => {
-    if (isOpen && resolvedCalibrations.length > 0) {
-      setExpandedPrinters(new Set(resolvedCalibrations.map(p => String(p.printer.id))));
+    if (!isOpen || !spool) return;
+    let cancelled = false;
+    const load = spoolmanMode ? api.getSpoolmanFilamentPresets : api.getSpoolFilamentPresets;
+    load(spool.id)
+      .then(rows => {
+        if (cancelled) return;
+        const next = new Map<string, PresetChoice>();
+        for (const row of rows) {
+          next.set(presetKey(row.printer_model, row.nozzle_diameter || ''), {
+            code: row.slicer_filament || '',
+            name: row.slicer_filament_name || '',
+          });
+        }
+        setModelPresets(next);
+      })
+      .catch(e => {
+        // Non-fatal: the tab still works, it just starts with nothing
+        // overridden. Saving from that state WOULD clear the stored rows, so
+        // say so rather than letting the user save over what they cannot see.
+        if (cancelled) return;
+        console.error('Failed to load filament preset overrides:', e);
+        showToast(t('inventory.filamentPresetsLoadFailed'), 'warning');
+      });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isOpen, spool?.id, spoolmanMode]);
+
+  // Legacy rows may have storage_location text but no location_id yet — link when catalog loads.
+  useEffect(() => {
+    if (!isOpen || !spool || locationIdTouched || formData.location_id != null) return;
+    const legacy = spool.storage_location?.trim();
+    if (!legacy || storageLocations.length === 0) return;
+    const match = storageLocations.find((l) => l.name.toLowerCase() === legacy.toLowerCase());
+    if (match) {
+      setFormData((prev) => (prev.location_id === match.id ? prev : { ...prev, location_id: match.id }));
     }
-  }, [isOpen, resolvedCalibrations]);
+  }, [isOpen, spool, storageLocations, formData.location_id, locationIdTouched]);
+
 
   // Update field helper
   const updateField = <K extends keyof SpoolFormData>(key: K, value: SpoolFormData[K]) => {
@@ -381,7 +527,7 @@ export function SpoolFormModal({
         : {}),
     }));
     if (key === 'weight_used') setWeightTouched(true);
-    if (key === 'storage_location') setStorageLocationTouched(true);
+    if (key === 'location_id') setLocationIdTouched(true);
     if (errors[key]) {
       setErrors(prev => ({ ...prev, [key]: undefined }));
     }
@@ -394,15 +540,18 @@ export function SpoolFormModal({
     const name = filament.name || '';
     const subtype = material && name.startsWith(material) ? name.slice(material.length).trim() : name;
     const rawHex = (filament.color_hex ?? '').replace('#', '').toUpperCase();
-    // Guard against short/malformed hex values — must be exactly 6 hex chars
-    const colorHex = /^[0-9A-F]{6}$/.test(rawHex) ? rawHex : '808080';
+    // Guard against short/malformed hex values — 6 chars (RRGGBB), or 8 when the
+    // filament is translucent and carries its own alpha (#2912). Rejecting 8 here
+    // prefilled a clear filament picked from the Spoolman catalogue as 808080FF.
+    const colorHex = /^[0-9A-F]{6}(?:[0-9A-F]{2})?$/.test(rawHex) ? rawHex : '808080';
+    const prefillRgba = colorHex.length === 8 ? colorHex : `${colorHex}FF`;
     setFormData(prev => ({
       ...prev,
       spoolman_filament_id: filament.id,
       material,
       subtype,
       brand: filament.vendor?.name || '',
-      rgba: `${colorHex}FF`,
+      rgba: prefillRgba,
       color_name: filament.color_name || '',
       label_weight: filament.weight ?? prev.label_weight,
     }));
@@ -422,10 +571,10 @@ export function SpoolFormModal({
         : api.createSpool(data as Parameters<typeof api.createSpool>[0]),
     onSuccess: async (newSpool) => {
       if (newSpool?.id) {
-        const ok = await saveKProfiles(newSpool.id);
+        const ok = await savePrinterProfiles(newSpool.id);
         if (!ok) return;
       }
-      await queryClient.invalidateQueries({ queryKey: spoolsQueryKey });
+      await refreshSpoolQueries();
       if (onSpoolsCreated) onSpoolsCreated([newSpool]);
       showToast(t('inventory.spoolCreated'), 'success');
       onClose();
@@ -459,12 +608,15 @@ export function SpoolFormModal({
         ? spoolmanResult.created
         : (result as InventorySpool[]);
 
-      if (selectedProfiles.size > 0) {
+      // Bulk create: every copy gets the same profiles and overrides. Skipped
+      // entirely when the user configured neither, so a plain bulk add does
+      // not fire two writes per spool.
+      if (selectedProfiles.size > 0 || modelPresets.size > 0) {
         for (const s of createdSpools) {
-          await saveKProfiles(s.id);
+          await savePrinterProfiles(s.id);
         }
       }
-      await queryClient.invalidateQueries({ queryKey: spoolsQueryKey });
+      await refreshSpoolQueries();
       if (onSpoolsCreated) onSpoolsCreated(createdSpools);
       if (spoolmanResult && spoolmanResult.failed_count > 0) {
         showToast(
@@ -495,10 +647,10 @@ export function SpoolFormModal({
         : api.updateSpool(spool!.id, data as Parameters<typeof api.updateSpool>[1]),
     onSuccess: async () => {
       if (spool?.id) {
-        const ok = await saveKProfiles(spool.id);
+        const ok = await savePrinterProfiles(spool.id);
         if (!ok) return;
       }
-      await queryClient.invalidateQueries({ queryKey: spoolsQueryKey });
+      await refreshSpoolQueries();
       showToast(t('inventory.spoolUpdated'), 'success');
       onClose();
     },
@@ -519,7 +671,7 @@ export function SpoolFormModal({
       return api.updateSpool(spool!.id, CLEAR_TAG_PAYLOAD as Parameters<typeof api.updateSpool>[1]);
     },
     onSuccess: async () => {
-      await queryClient.invalidateQueries({ queryKey: spoolsQueryKey });
+      await refreshSpoolQueries();
       showToast(t('inventory.rfidCleared', 'RFID tag cleared'), 'success');
       onClose();
     },
@@ -566,6 +718,18 @@ export function SpoolFormModal({
     queryFn: api.getSettings,
     enabled: isOpen,
   });
+
+  // Backend Bambu printer-model registry, so the Printers tab can read the
+  // model out of a preset name and offer each model only its own presets. The
+  // same query key and staleTime the Configure AMS Slot modal uses -- the
+  // registry only changes across backend releases, so this is a cache hit
+  // whenever that modal has been opened.
+  const { data: printerModelsData } = useQuery({
+    queryKey: ['slicerPrinterModels'],
+    queryFn: api.getSlicerPrinterModels,
+    enabled: isOpen,
+    staleTime: Infinity,
+  });
   const availableCategories = (() => {
     const set = new Set<string>();
     for (const s of allSpools ?? []) {
@@ -601,65 +765,66 @@ export function SpoolFormModal({
     },
   });
 
-  // Save K-profiles for selected calibrations. Returns false if any error occurred.
-  const saveKProfiles = async (spoolId: number): Promise<boolean> => {
-    const saveApi = spoolmanMode ? api.saveSpoolmanKProfiles : api.saveSpoolKProfiles;
+  // Save everything the Printers tab holds: one K profile per hotend and the
+  // per-printer-model preset overrides. Returns false if either write failed,
+  // which keeps the modal open so the user does not lose what they picked.
+  const savePrinterProfiles = async (spoolId: number): Promise<boolean> => {
+    const saveKApi = spoolmanMode ? api.saveSpoolmanKProfiles : api.saveSpoolKProfiles;
+    const savePresetApi = spoolmanMode ? api.saveSpoolmanFilamentPresets : api.saveSpoolFilamentPresets;
 
-    if (selectedProfiles.size === 0) {
-      try {
-        await saveApi(spoolId, []);
-        return true;
-      } catch (e) {
-        console.error('Failed to save K-profiles:', e);
-        showToast(t('inventory.kProfileSaveFailed'), 'warning');
-        return false;
-      }
-    }
-
+    // The selection Map is keyed by hotend and holds the calibration itself,
+    // so nothing has to be resolved back out of the printer's live list. That
+    // also fixes a real defect in the old key-based lookup: it matched a
+    // calibration by cali_idx alone, and cali_idx is numbered PER NOZZLE --
+    // on a dual-nozzle printer it could resolve the other hotend's entry and
+    // persist that entry's K value and diameter.
     const profiles: SpoolKProfileInput[] = [];
-    let dropped = 0;
-    for (const key of selectedProfiles) {
-      const [printerIdStr, caliIdxStr, extruderStr] = key.split(':');
-      const printerId = parseInt(printerIdStr);
-      const caliIdx = parseInt(caliIdxStr);
-      const extruder = extruderStr === 'null' ? 0 : parseInt(extruderStr);
-
-      const pc = resolvedCalibrations.find(p => p.printer.id === printerId);
-      if (pc) {
-        const cal = pc.calibrations.find(c => c.cali_idx === caliIdx);
-        if (cal) {
-          profiles.push({
-            printer_id: printerId,
-            extruder,
-            nozzle_diameter: cal.nozzle_diameter || '0.4',
-            k_value: cal.k_value,
-            name: cal.name || null,
-            cali_idx: cal.cali_idx,
-            setting_id: cal.setting_id || null,
-          });
-        } else {
-          dropped++;
-        }
-      } else {
-        dropped++;
-      }
+    for (const [key, cal] of selectedProfiles) {
+      const [printerIdStr, extruderStr, diameter] = key.split(':');
+      profiles.push({
+        printer_id: parseInt(printerIdStr),
+        extruder: parseInt(extruderStr),
+        nozzle_diameter: diameter || '0.4',
+        // The flow the profile was measured on, when the printer declares one.
+        // Null where it does not (an X1C declares none on any profile), which
+        // the backend reads as "applies to whatever is fitted" -- the same rule
+        // that keeps every profile stored before this working.
+        nozzle_type: normaliseFlow(cal.nozzle_id),
+        k_value: cal.k_value,
+        name: cal.name || null,
+        cali_idx: cal.cali_idx,
+        setting_id: cal.setting_id || null,
+      });
     }
 
-    if (dropped > 0) {
-      console.error(`saveKProfiles: ${dropped} profile key(s) could not be resolved`, Array.from(selectedProfiles));
+    const presets: SpoolFilamentPresetInput[] = [];
+    for (const [key, choice] of modelPresets) {
+      const { model, diameter } = parsePresetKey(key);
+      if (!model) continue;
+      presets.push({
+        printer_model: model,
+        nozzle_diameter: diameter,
+        slicer_filament: choice.code || null,
+        slicer_filament_name: choice.name || null,
+      });
+    }
+
+    // Both are full replacements, so both run even when empty -- that is how
+    // the user clears the last profile or the last override.
+    try {
+      await saveKApi(spoolId, profiles);
+    } catch (e) {
+      console.error('Failed to save K-profiles:', e);
       showToast(t('inventory.kProfileSaveFailed'), 'warning');
       return false;
     }
 
-    if (profiles.length > 0) {
-      try {
-        await saveApi(spoolId, profiles);
-        return true;
-      } catch (e) {
-        console.error('Failed to save K-profiles:', e);
-        showToast(t('inventory.kProfileSaveFailed'), 'warning');
-        return false;
-      }
+    try {
+      await savePresetApi(spoolId, presets);
+    } catch (e) {
+      console.error('Failed to save filament preset overrides:', e);
+      showToast(t('inventory.filamentPresetSaveFailed'), 'warning');
+      return false;
     }
 
     return true;
@@ -678,7 +843,7 @@ export function SpoolFormModal({
   if (!isOpen) return null;
 
   const handleSubmit = () => {
-    const validation = validateForm(formData, quickAdd, spoolmanMode);
+    const validation = validateForm(formData, quickAdd, spoolmanMode, mode);
     if (!validation.isValid) {
       setErrors(validation.errors);
       if (validation.errors.slicer_filament || validation.errors.material || validation.errors.brand || validation.errors.subtype) {
@@ -717,11 +882,10 @@ export function SpoolFormModal({
       data.weight_used = formData.weight_used;
     }
 
-    // Only send storage_location when creating or when explicitly changed by the user.
-    // This prevents the modal round-trip from overwriting the Spoolman location field
-    // with a stale cached value when the user saves without touching this field.
-    if (!isEditing || storageLocationTouched) {
-      data.storage_location = formData.storage_location || null;
+    // Only send location_id when creating or when explicitly changed by the user.
+    // Backend derives storage_location; omitting on untouched edit avoids stale overwrites.
+    if (!isEditing || locationIdTouched) {
+      data.location_id = formData.location_id;
     }
 
     if (isEditing) {
@@ -742,7 +906,12 @@ export function SpoolFormModal({
         onClick={onClose}
       />
 
-      <div className="relative w-full max-w-xl mx-4 bg-bambu-dark-secondary border border-bambu-dark-tertiary rounded-xl shadow-2xl max-h-[90vh] flex flex-col">
+      {/* Wider than the old max-w-xl: the Printers tab is a model list beside
+          a detail pane holding a preset row per nozzle size and a hotend-by-
+          size grid, which needs room for both. Held constant across tabs
+          rather than sized per tab -- a modal that resizes as you switch tabs
+          reads as a layout bug. */}
+      <div className="relative w-full max-w-5xl mx-4 bg-bambu-dark-secondary border border-bambu-dark-tertiary rounded-xl shadow-2xl max-h-[90vh] flex flex-col">
         {/* Header */}
         <div className="flex items-center justify-between p-4 border-b border-bambu-dark-tertiary flex-shrink-0">
           <h2 className="text-lg font-semibold text-white flex items-baseline gap-2">
@@ -767,7 +936,7 @@ export function SpoolFormModal({
         {mode === 'create' && (
           <div className="flex items-center justify-between px-4 py-2 border-b border-bambu-dark-tertiary flex-shrink-0">
             <div className="flex items-center gap-2">
-              <Zap className="w-4 h-4 text-amber-400" />
+              <Zap className="w-4 h-4 text-amber-600 dark:text-amber-400" />
               <span className="text-sm text-white">{t('inventory.quickAdd')}</span>
             </div>
             <button
@@ -799,20 +968,33 @@ export function SpoolFormModal({
                 : 'text-bambu-gray hover:text-white'
             }`}
           >
-            <Palette className="w-4 h-4" />
+            <Beaker className="w-4 h-4" />
             {t('inventory.filamentInfoTab')}
           </button>
           {!quickAdd && (
             <button
-              onClick={() => setActiveTab('pa-profile')}
+              onClick={() => setActiveTab('appearance')}
               className={`flex-1 px-4 py-2.5 text-sm font-medium flex items-center justify-center gap-2 transition-colors ${
-                activeTab === 'pa-profile'
+                activeTab === 'appearance'
                   ? 'text-bambu-green border-b-2 border-bambu-green'
                   : 'text-bambu-gray hover:text-white'
               }`}
             >
-              <Beaker className="w-4 h-4" />
-              {t('inventory.paProfileTab')}
+              <Palette className="w-4 h-4" />
+              {t('inventory.colorAndCostTab')}
+            </button>
+          )}
+          {!quickAdd && (
+            <button
+              onClick={() => setActiveTab('printers')}
+              className={`flex-1 px-4 py-2.5 text-sm font-medium flex items-center justify-center gap-2 transition-colors ${
+                activeTab === 'printers'
+                  ? 'text-bambu-green border-b-2 border-bambu-green'
+                  : 'text-bambu-gray hover:text-white'
+              }`}
+            >
+              <Zap className="w-4 h-4" />
+              {t('inventory.printersTab')}
               {selectedProfileCount > 0 && (
                 <span className="text-xs px-1.5 py-0.5 rounded-full bg-bambu-green/20 text-bambu-green">
                   {selectedProfileCount}
@@ -830,7 +1012,7 @@ export function SpoolFormModal({
               {spoolmanMode && !isEditing && (
                 <div>
                   {filamentsError ? (
-                    <p className="text-sm text-red-400 px-1">{t('inventory.spoolmanCatalogLoadFailed')}</p>
+                    <p className="text-sm text-red-700 dark:text-red-400 px-1">{t('inventory.spoolmanCatalogLoadFailed')}</p>
                   ) : (
                     <SpoolmanFilamentPicker
                       filaments={spoolmanFilaments}
@@ -858,13 +1040,19 @@ export function SpoolFormModal({
                   filamentOptions={filamentOptions}
                   availableBrands={availableBrands}
                   availableMaterials={availableMaterials}
+                  suggestedBrands={suggestedBrands}
+                  suggestedMaterials={suggestedMaterials}
                   quickAdd={quickAdd}
+                  detailsRequired={!quickAdd && !spoolmanMode && mode === 'create'}
                   quantity={quantity}
                   onQuantityChange={setQuantity}
                   errors={errors}
                 />
               </div>
 
+            </div>
+          ) : activeTab === 'appearance' ? (
+            <div className="space-y-6">
               {/* Color Section */}
               <div>
                 <h3 className="text-sm font-semibold text-bambu-gray uppercase tracking-wide mb-3">
@@ -890,6 +1078,23 @@ export function SpoolFormModal({
                   spoolCatalog={spoolCatalog}
                   currencySymbol={currencySymbol}
                   availableCategories={availableCategories}
+                  availableLocations={storageLocations}
+                  onCreateLocation={async (name) => {
+                    try {
+                      const created = await api.createLocation({ name });
+                      setStorageLocations((prev) => [...prev, { id: created.id, name: created.name }].sort((a, b) => a.name.localeCompare(b.name)));
+                      await invalidateInventoryLocations(queryClient);
+                      return { id: created.id, name: created.name };
+                    } catch (e) {
+                      // Surface the backend's actual error so the user can
+                      // distinguish 409 duplicate / 400 validation / 500 from
+                      // a generic "save failed" message.
+                      console.error(e);
+                      const message = e instanceof Error ? e.message : t('locations.saveFailed');
+                      showToast(message || t('locations.saveFailed'), 'error');
+                      return null;
+                    }
+                  }}
                   globalLowStockThreshold={globalLowStockThreshold}
                   spoolmanMode={spoolmanMode}
                 />
@@ -903,14 +1108,18 @@ export function SpoolFormModal({
               )}
             </div>
           ) : (
-            <PAProfileSection
+            <PrinterProfilesSection
               formData={formData}
-              updateField={updateField}
               printersWithCalibrations={resolvedCalibrations}
+              filamentOptions={filamentOptions}
+              modelPresets={modelPresets}
+              setModelPresets={setModelPresets}
               selectedProfiles={selectedProfiles}
               setSelectedProfiles={setSelectedProfiles}
-              expandedPrinters={expandedPrinters}
-              setExpandedPrinters={setExpandedPrinters}
+              selectedGroupId={selectedGroupId}
+              setSelectedGroupId={setSelectedGroupId}
+              printerModels={printerModelsData}
+              isLoading={loadingCalibrations}
             />
           )}
         </div>

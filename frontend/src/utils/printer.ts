@@ -12,9 +12,40 @@ export function getPrinterImage(model: string | null | undefined): string {
   if (m.includes('p2s')) return '/img/printers/p1s.png';
   if (m.includes('p1s')) return '/img/printers/p1s.png';
   if (m.includes('p1p')) return '/img/printers/p1p.png';
+  if (m.includes('a2l') || m === 'n9') return '/img/printers/a2l.png';
   if (m.includes('a1mini')) return '/img/printers/a1mini.png';
   if (m.includes('a1')) return '/img/printers/a1.png';
   return '/img/printers/default.png';
+}
+
+// Ceiling for every chamber-temperature target the UI accepts (manual set,
+// preheat filament map, per-item preheat override, chamber quick-select
+// presets). Mirrors backend MAX_CHAMBER_TEMP_C in
+// backend/app/utils/printer_models.py — keep the two in sync. The H2 series
+// (H2C / H2D / H2D Pro / H2S) and X2D heat the chamber to 65 °C; X1E tops out
+// at 60 and its firmware clamps anything higher.
+export const MAX_CHAMBER_TEMP_C = 65;
+
+// G-code interchange families (#2578). Mirrors backend GCODE_COMPAT_FAMILIES
+// in backend/app/utils/printer_models.py — keep the two in sync. A sliced 3MF
+// may target a different model ONLY within its family; everything else is
+// exact-match only.
+const GCODE_COMPAT_FAMILIES: ReadonlyArray<ReadonlySet<string>> = [
+  new Set(['X1', 'X1C', 'X1E', 'P1P', 'P1S']),
+];
+
+/** True when G-code sliced for one model may be dispatched to the other.
+ *  Unknown/missing metadata on either side returns true (can't validate). */
+export function isGcodeCompatible(
+  slicedForModel: string | null | undefined,
+  targetModel: string | null | undefined,
+): boolean {
+  if (!slicedForModel || !targetModel) return true;
+  const norm = (m: string) => m.trim().toUpperCase().replace(/[\s-]/g, '');
+  const a = norm(slicedForModel);
+  const b = norm(targetModel);
+  if (a === b) return true;
+  return GCODE_COMPAT_FAMILIES.some((family) => family.has(a) && family.has(b));
 }
 
 export function getWifiStrength(rssi: number): { labelKey: string; color: string; bars: number } {
@@ -25,7 +56,23 @@ export function getWifiStrength(rssi: number): { labelKey: string; color: string
   return { labelKey: 'printers.wifiSignal.veryWeak', color: 'text-red-400', bars: 1 };
 }
 
-import type { PrintQueueItem } from '../api/client';
+import type { PrinterStatus, PrintQueueItem } from '../api/client';
+
+/**
+ * True when a queue item aimed at this printer would start now rather than wait.
+ *
+ * Every print Bambuddy sends goes through the queue, so this is not "can we
+ * print at all" — it is "will ASAP mean now". The PrintModal uses it to promise
+ * a later start, and the printer card uses it to say whether a dropped file
+ * prints or queues. Both must agree, or the card promises one thing and the
+ * modal immediately says another.
+ */
+export function isPrinterCurrentlyDispatchable(status: PrinterStatus | undefined): boolean {
+  if (!status?.connected) return false;
+  if (status.awaiting_plate_clear) return false;
+  if (status.ams?.some((ams) => ams.dry_time > 0)) return false;
+  return ['IDLE', 'FINISH', 'FAILED'].includes(status.state ?? '');
+}
 
 /**
  * Filters queue items based on printer compatibility (filament types and colors).
@@ -33,12 +80,19 @@ import type { PrintQueueItem } from '../api/client';
  * @param items - Array of queue items to filter
  * @param loadedFilamentTypes - Set of loaded filament types (e.g., "PLA", "PETG")
  * @param loadedFilaments - Set of loaded filament type+color pairs (e.g., "PLA:ffffff", "PETG:ff0000")
+ * @param loadedVariants - Set of loaded type+color+tray_info_idx triples
+ *   (e.g., "PLA:ffffff:GFA01"; the idx is "" for custom/third-party spools). Used to
+ *   distinguish Bambu PLA sub-variants (Basic GFA00 / Matte GFA01 / Silk GFA06) that
+ *   share a base type+colour, mirroring the backend _get_missing_force_color_slots (#2650).
+ *   When omitted, force matching falls back to type+colour so the hint is never stricter
+ *   than the data available.
  * @returns Array of compatible queue items
  */
 export function filterCompatibleQueueItems(
   items: PrintQueueItem[],
   loadedFilamentTypes?: Set<string>,
-  loadedFilaments?: Set<string>
+  loadedFilaments?: Set<string>,
+  loadedVariants?: Set<string>
 ): PrintQueueItem[] {
   return items.filter(item => {
     // Type check: all required filament types must be loaded
@@ -55,12 +109,20 @@ export function filterCompatibleQueueItems(
       const forceOverrides = item.filament_overrides.filter(o => o.force_color_match === true);
       const prefOverrides = item.filament_overrides.filter(o => o.force_color_match !== true);
 
-      // All force-matched slots must have exact type+color on this printer
+      // All force-matched slots must have an exact type+color match — and, when the
+      // override carries a tray_info_idx, the same variant too (a loaded tray with a
+      // blank idx still satisfies it, matching the backend's type+colour fallback).
       if (forceOverrides.length > 0) {
         const allForceMatch = forceOverrides.every(o => {
           const oType = (o.type || '').toUpperCase();
           const oColor = (o.color || '').replace('#', '').toLowerCase().slice(0, 6);
-          return loadedFilaments.has(`${oType}:${oColor}`);
+          const oIdx = o.tray_info_idx || '';
+          // No variant on the override, or no variant data supplied → type+colour only.
+          if (!oIdx || loadedVariants === undefined) {
+            return loadedFilaments.has(`${oType}:${oColor}`);
+          }
+          // Variant-specific: same idx, or a same-colour tray that reports no idx.
+          return loadedVariants.has(`${oType}:${oColor}:${oIdx}`) || loadedVariants.has(`${oType}:${oColor}:`);
         });
         if (!allForceMatch) return false;
       }

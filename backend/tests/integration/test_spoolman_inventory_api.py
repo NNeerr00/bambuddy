@@ -74,6 +74,10 @@ def mock_spoolman_client():
     # branch override this on the fly.
     mock_client.is_filament_shared = AsyncMock(return_value=False)
     mock_client.ensure_extra_field = AsyncMock(return_value=True)
+    # list_spools calls maybe_sync_spoolman_locations which invokes
+    # get_distinct_locations on the route-resolved client. Empty list keeps the
+    # mock honest without staging phantom catalog rows.
+    mock_client.get_distinct_locations = AsyncMock(return_value=[])
 
     with (
         patch(
@@ -376,6 +380,88 @@ class TestSpoolmanInventoryCRUD:
 
     @pytest.mark.asyncio
     @pytest.mark.integration
+    async def test_create_spool_keeps_a_clear_colour_translucent(
+        self,
+        async_client: AsyncClient,
+        spoolman_settings,
+        mock_spoolman_client,
+    ):
+        """#2912: the create route truncated rgba to six characters, so entering
+        "fully transparent" by hand landed on the same opaque black as the AMS
+        case in the report."""
+        payload = {
+            "material": "PLA",
+            "rgba": "00000000",
+            "label_weight": 1000,
+            "weight_used": 0,
+        }
+        response = await async_client.post("/api/v1/spoolman/inventory/spools", json=payload)
+
+        assert response.status_code == 200
+        assert mock_spoolman_client.find_or_create_filament.call_args.kwargs["color_hex"] == "00000000"
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_create_spool_keeps_an_opaque_colour_at_six(
+        self,
+        async_client: AsyncClient,
+        spoolman_settings,
+        mock_spoolman_client,
+    ):
+        """The opaque case has to stay six characters or every create starts
+        writing a shape the rest of the instance does not hold."""
+        payload = {
+            "material": "PLA",
+            "rgba": "FF0000FF",
+            "label_weight": 1000,
+            "weight_used": 0,
+        }
+        response = await async_client.post("/api/v1/spoolman/inventory/spools", json=payload)
+
+        assert response.status_code == 200
+        assert mock_spoolman_client.find_or_create_filament.call_args.kwargs["color_hex"] == "FF0000"
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_update_alpha_only_edit_reaches_the_filament(
+        self,
+        async_client: AsyncClient,
+        spoolman_settings,
+        mock_spoolman_client,
+    ):
+        """#2912: making a spool translucent is a real change to the filament's
+        colour. Comparing bare RGB prefixes would call it a no-op and the edit
+        would never land."""
+        # Sample filament is FF0000; make it half-transparent.
+        payload = {"rgba": "FF000080"}
+        response = await async_client.patch("/api/v1/spoolman/inventory/spools/42", json=payload)
+
+        assert response.status_code == 200
+        mock_spoolman_client.patch_filament.assert_called_once()
+        assert mock_spoolman_client.patch_filament.call_args.args[1]["color_hex"] == "FF000080"
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
+    async def test_update_with_the_round_tripped_opaque_rgba_is_a_no_op(
+        self,
+        async_client: AsyncClient,
+        spoolman_settings,
+        mock_spoolman_client,
+    ):
+        """#2912: the read side hands the frontend FF0000FF for a filament stored
+        as FF0000, and the edit form sends it straight back. Comparing raw strings
+        would make metadata_unchanged permanently False and PATCH the filament on
+        every no-op edit.
+        """
+        payload = {"rgba": "FF0000FF", "note": "unrelated change"}
+        response = await async_client.patch("/api/v1/spoolman/inventory/spools/42", json=payload)
+
+        assert response.status_code == 200
+        mock_spoolman_client.patch_filament.assert_not_called()
+        mock_spoolman_client.find_or_create_filament.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.integration
     async def test_update_shared_filament_falls_back_to_find_or_create(
         self,
         async_client: AsyncClient,
@@ -560,13 +646,13 @@ class TestSpoolmanInventoryCRUD:
 
     @pytest.mark.asyncio
     @pytest.mark.integration
-    async def test_reset_spool_usage(
+    async def test_reset_spool_consumed_counter(
         self,
         async_client: AsyncClient,
         spoolman_settings,
         mock_spoolman_client,
     ):
-        """POST /spoolman/inventory/spools/{id}/reset-usage zeroes used_weight in Spoolman.
+        """POST /spoolman/inventory/spools/{id}/reset-consumed-counter zeroes the displayed counter.
 
         Parity with internal mode (#1390): the InventorySpool response
         carries `weight_used = label - remaining` and
@@ -575,7 +661,7 @@ class TestSpoolmanInventoryCRUD:
         while remaining (= label - weight_used) preserves Spoolman's
         independent remaining_weight field.
         """
-        response = await async_client.post("/api/v1/spoolman/inventory/spools/42/reset-usage")
+        response = await async_client.post("/api/v1/spoolman/inventory/spools/42/reset-consumed-counter")
 
         assert response.status_code == 200
         body = response.json()
@@ -588,15 +674,15 @@ class TestSpoolmanInventoryCRUD:
 
     @pytest.mark.asyncio
     @pytest.mark.integration
-    async def test_bulk_reset_spool_usage(
+    async def test_bulk_reset_spool_consumed_counter(
         self,
         async_client: AsyncClient,
         spoolman_settings,
         mock_spoolman_client,
     ):
-        """Bulk endpoint resets each listed spool and returns the count."""
+        """Bulk endpoint resets each listed spool's counter and returns the count."""
         response = await async_client.post(
-            "/api/v1/spoolman/inventory/spools/reset-usage-bulk",
+            "/api/v1/spoolman/inventory/spools/reset-consumed-counter-bulk",
             json={"spool_ids": [1, 2, 3]},
         )
 
@@ -614,7 +700,7 @@ class TestSpoolmanInventoryCRUD:
     ):
         """Empty list must be rejected — guards against accidental wildcard wipes."""
         response = await async_client.post(
-            "/api/v1/spoolman/inventory/spools/reset-usage-bulk",
+            "/api/v1/spoolman/inventory/spools/reset-consumed-counter-bulk",
             json={"spool_ids": []},
         )
 

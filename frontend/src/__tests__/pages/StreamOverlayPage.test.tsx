@@ -11,6 +11,7 @@ import { MemoryRouter, Route, Routes } from 'react-router-dom';
 import { QueryClient, QueryClientProvider } from '@tanstack/react-query';
 import { ThemeProvider } from '../../contexts/ThemeContext';
 import { ToastProvider } from '../../contexts/ToastContext';
+import { AuthProvider } from '../../contexts/AuthContext';
 
 const mockPrinter = {
   id: 1,
@@ -60,13 +61,15 @@ function renderOverlayPage(printerId: number, queryParams = '') {
   return rtlRender(
     <QueryClientProvider client={queryClient}>
       <MemoryRouter initialEntries={[`/overlay/${printerId}${queryParams}`]}>
-        <ThemeProvider>
-          <ToastProvider>
-            <Routes>
-              <Route path="/overlay/:printerId" element={<StreamOverlayPage />} />
-            </Routes>
-          </ToastProvider>
-        </ThemeProvider>
+        <AuthProvider>
+          <ThemeProvider>
+            <ToastProvider>
+              <Routes>
+                <Route path="/overlay/:printerId" element={<StreamOverlayPage />} />
+              </Routes>
+            </ToastProvider>
+          </ThemeProvider>
+        </AuthProvider>
       </MemoryRouter>
     </QueryClientProvider>
   );
@@ -76,12 +79,17 @@ describe('StreamOverlayPage', () => {
   const originalTitle = document.title;
 
   beforeEach(() => {
-    // Mock WebSocket
-    vi.stubGlobal('WebSocket', vi.fn().mockImplementation(() => ({
-      close: vi.fn(),
-      onmessage: null,
-      onerror: null,
-    })));
+    // Mock WebSocket. vitest 4 dropped support for arrow-function constructor
+    // mocks (`new (() => ...)` throws "is not a constructor"); use a plain
+    // function so `new WebSocket(...)` resolves correctly.
+    vi.stubGlobal(
+      'WebSocket',
+      vi.fn().mockImplementation(function (this: { close: () => void; onmessage: null; onerror: null }) {
+        this.close = vi.fn();
+        this.onmessage = null;
+        this.onerror = null;
+      }),
+    );
 
     server.use(
       http.get('/api/v1/printers/:id', () => {
@@ -358,6 +366,213 @@ describe('StreamOverlayPage', () => {
       await waitFor(() => {
         expect(screen.getByText('Printer offline')).toBeInTheDocument();
       });
+    });
+  });
+
+  describe('kiosk token mode (#2613)', () => {
+    const mockOverlayPrinting = {
+      id: 1,
+      name: 'X1 Carbon',
+      camera_rotation: 0,
+      connected: true,
+      state: 'RUNNING',
+      current_print: 'KioskBenchy.gcode.3mf',
+      gcode_file: 'plate_1.gcode',
+      progress: 67,
+      remaining_time: 40,
+      layer_num: 10,
+      total_layers: 20,
+      stg_cur_name: null,
+      time_format: 'system',
+    };
+
+    it('reads the token-authed overlay-status feed and carries the token to the camera', async () => {
+      let overlayHit = false;
+      server.use(
+        http.get('/api/v1/printers/:id/overlay-status', () => {
+          overlayHit = true;
+          return HttpResponse.json(mockOverlayPrinting);
+        })
+      );
+
+      renderOverlayPage(1, '?token=obs-tok');
+
+      await waitFor(() => {
+        expect(screen.getByText('KioskBenchy')).toBeInTheDocument();
+      });
+      expect(overlayHit).toBe(true);
+      expect(screen.getByText('67%')).toBeInTheDocument();
+
+      // The camera <img> must carry the same kiosk token — a fresh OBS browser
+      // has no session to mint a camera stream token from.
+      const img = screen.getByAltText('Camera stream') as HTMLImageElement;
+      expect(img.src).toContain('token=obs-tok');
+    });
+
+    it('does not touch the JWT-only status endpoint or a WebSocket in kiosk mode', async () => {
+      let statusHit = false;
+      server.use(
+        http.get('/api/v1/printers/:id/overlay-status', () => HttpResponse.json(mockOverlayPrinting)),
+        http.get('/api/v1/printers/:id/status', () => {
+          statusHit = true;
+          return HttpResponse.json(mockStatusIdle);
+        })
+      );
+
+      renderOverlayPage(1, '?token=obs-tok');
+
+      await waitFor(() => {
+        expect(screen.getByText('KioskBenchy')).toBeInTheDocument();
+      });
+      // The logged-in status query is disabled when a token is present, so an
+      // unauthenticated OBS browser never fires a doomed 401 (or opens a socket).
+      expect(statusHit).toBe(false);
+      expect(WebSocket).not.toHaveBeenCalled();
+    });
+  });
+
+  describe('temperatures (#1422)', () => {
+    const withTemps = {
+      ...mockStatusPrinting,
+      temperatures: {
+        nozzle: 219.6,
+        nozzle_target: 220,
+        bed: 60,
+        bed_target: 60,
+        chamber: 38.4,
+      },
+    };
+
+    beforeEach(() => {
+      server.use(http.get('/api/v1/printers/:id/status', () => HttpResponse.json(withTemps)));
+    });
+
+    it('draws no temperatures unless the URL asks for them', async () => {
+      renderOverlayPage(1);
+
+      await waitFor(() => {
+        expect(screen.getByText('45%')).toBeInTheDocument();
+      });
+      // Default ?show= is unchanged by #1422, so overlays already running in an
+      // OBS scene look identical after the upgrade.
+      expect(screen.queryByText('Nozzle')).not.toBeInTheDocument();
+      expect(screen.queryByText('Bed')).not.toBeInTheDocument();
+    });
+
+    it('draws only the readings named in ?show=', async () => {
+      renderOverlayPage(1, '?show=progress,nozzle');
+
+      await waitFor(() => {
+        expect(screen.getByText('Nozzle')).toBeInTheDocument();
+      });
+      expect(screen.queryByText('Bed')).not.toBeInTheDocument();
+      expect(screen.queryByText('Chamber')).not.toBeInTheDocument();
+    });
+
+    it('rounds the reading and hides a target it has already reached', async () => {
+      renderOverlayPage(1, '?show=nozzle,bed');
+
+      await waitFor(() => {
+        expect(screen.getByText('220°C')).toBeInTheDocument();
+      });
+      // Nozzle is 219.6 against a target of 220: both round to 220, so the
+      // "/ 220°C" half is dropped rather than reading "220 / 220°C" all print.
+      expect(screen.queryByText('/')).not.toBeInTheDocument();
+      expect(screen.getByText('60°C')).toBeInTheDocument();
+    });
+
+    it('shows the target while the heater is still climbing', async () => {
+      server.use(
+        http.get('/api/v1/printers/:id/status', () =>
+          HttpResponse.json({ ...withTemps, temperatures: { nozzle: 140, nozzle_target: 220 } }),
+        ),
+      );
+      renderOverlayPage(1, '?show=nozzle');
+
+      await waitFor(() => {
+        expect(screen.getByText('140°C')).toBeInTheDocument();
+      });
+      expect(screen.getByText('220°C')).toBeInTheDocument();
+    });
+
+    it('skips a reading the printer does not report', async () => {
+      server.use(
+        http.get('/api/v1/printers/:id/status', () =>
+          // A P1S: the backend drops chamber for models without a real sensor,
+          // so asking for it in ?show= must not produce an empty row.
+          HttpResponse.json({ ...withTemps, temperatures: { nozzle: 200, bed: 55 } }),
+        ),
+      );
+      renderOverlayPage(1, '?show=nozzle,bed,chamber');
+
+      await waitFor(() => {
+        expect(screen.getByText('Nozzle')).toBeInTheDocument();
+      });
+      expect(screen.queryByText('Chamber')).not.toBeInTheDocument();
+    });
+
+    it('draws both nozzles on a dual-nozzle printer', async () => {
+      server.use(
+        http.get('/api/v1/printers/:id/status', () =>
+          HttpResponse.json({
+            ...withTemps,
+            temperatures: { nozzle: 220, nozzle_2: 250, nozzle_2_target: 250 },
+          }),
+        ),
+      );
+      renderOverlayPage(1, '?show=nozzle');
+
+      await waitFor(() => {
+        expect(screen.getByText('Nozzle')).toBeInTheDocument();
+      });
+      expect(screen.getByText('Nozzle 2')).toBeInTheDocument();
+      expect(screen.getByText('250°C')).toBeInTheDocument();
+    });
+
+    it('draws temperatures while the printer is idle', async () => {
+      server.use(
+        http.get('/api/v1/printers/:id/status', () =>
+          HttpResponse.json({ ...mockStatusIdle, temperatures: { bed: 45, bed_target: 60 } }),
+        ),
+      );
+      renderOverlayPage(1, '?show=bed');
+
+      await waitFor(() => {
+        expect(screen.getByText('Printer is idle')).toBeInTheDocument();
+      });
+      // A preheating printer is exactly when the readings are worth watching,
+      // so they are not gated behind a running print.
+      expect(screen.getByText('45°C')).toBeInTheDocument();
+      expect(screen.getByText('60°C')).toBeInTheDocument();
+    });
+
+    it('reads temperatures from the token-authed feed in kiosk mode', async () => {
+      server.use(
+        http.get('/api/v1/printers/:id/overlay-status', () =>
+          HttpResponse.json({
+            id: 1,
+            name: 'X1 Carbon',
+            camera_rotation: 0,
+            connected: true,
+            state: 'RUNNING',
+            current_print: 'KioskBenchy.gcode.3mf',
+            gcode_file: 'plate_1.gcode',
+            progress: 67,
+            remaining_time: 40,
+            layer_num: 10,
+            total_layers: 20,
+            stg_cur_name: null,
+            temperatures: { chamber: 38, chamber_target: 40 },
+            time_format: 'system',
+          }),
+        ),
+      );
+      renderOverlayPage(1, '?token=obs-tok&show=chamber');
+
+      await waitFor(() => {
+        expect(screen.getByText('Chamber')).toBeInTheDocument();
+      });
+      expect(screen.getByText('38°C')).toBeInTheDocument();
     });
   });
 });

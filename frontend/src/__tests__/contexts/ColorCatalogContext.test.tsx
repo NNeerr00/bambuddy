@@ -27,13 +27,13 @@ function createWrapper() {
     return (
       <QueryClientProvider client={queryClient}>
         <BrowserRouter>
-          <ThemeProvider>
-            <ToastProvider>
-              <AuthProvider>
+          <AuthProvider>
+            <ThemeProvider>
+              <ToastProvider>
                 <ColorCatalogProvider>{children}</ColorCatalogProvider>
-              </AuthProvider>
-            </ToastProvider>
-          </ThemeProvider>
+              </ToastProvider>
+            </ThemeProvider>
+          </AuthProvider>
         </BrowserRouter>
       </QueryClientProvider>
     );
@@ -79,6 +79,49 @@ describe('ColorCatalogProvider', () => {
     });
     expect(getColorName('de4343')).toBe('Scarlet Red');
     expect(getColorName('8344b0')).toBe('Purple');
+  });
+
+  it('carries the material-qualified names through to getColorName (#2875)', async () => {
+    server.use(
+      http.get('/api/v1/inventory/colors/map', () =>
+        HttpResponse.json({
+          colors: { ffffff: 'Jade White' },
+          by_material: { 'pla matte|ffffff': 'Ivory White' },
+        })
+      )
+    );
+
+    const Wrapper = createWrapper();
+    render(
+      <Wrapper>
+        <div>ok</div>
+      </Wrapper>
+    );
+
+    await waitFor(() => {
+      expect(getColorName('ffffff', 'PLA Matte')).toBe('Ivory White');
+    });
+    expect(getColorName('ffffff')).toBe('Jade White');
+  });
+
+  it('accepts a response with no by_material at all', async () => {
+    // An older backend, or a catalog with nothing ambiguous in it.
+    server.use(
+      http.get('/api/v1/inventory/colors/map', () =>
+        HttpResponse.json({ colors: { ffffff: 'Jade White' } })
+      )
+    );
+
+    const Wrapper = createWrapper();
+    render(
+      <Wrapper>
+        <div>ok</div>
+      </Wrapper>
+    );
+
+    await waitFor(() => {
+      expect(getColorName('ffffff', 'PLA Matte')).toBe('Jade White');
+    });
   });
 
   it('still renders children even when the catalog fetch fails', async () => {

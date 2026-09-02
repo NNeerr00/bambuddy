@@ -30,7 +30,9 @@ export const KNOWN_VARIANTS = [
   'Gradient', 'Dual Color', 'Tri Color', 'Multicolor',
 ];
 
-// Quick color swatches - most common colors (shown by default)
+// Quick color swatches - most common colors (shown by default).
+// `Clear` is the only 8-char preset (alpha 00) — native `<input type="color">`
+// cannot pick alpha, so a dedicated preset is the only way to set it (#1545).
 export const QUICK_COLORS: ColorPreset[] = [
   { name: 'Black', hex: '000000' },
   { name: 'White', hex: 'FFFFFF' },
@@ -44,6 +46,7 @@ export const QUICK_COLORS: ColorPreset[] = [
   { name: 'Pink', hex: 'FF69B4' },
   { name: 'Brown', hex: '8B4513' },
   { name: 'Silver', hex: 'C0C0C0' },
+  { name: 'Clear', hex: '00000000' },
 ];
 
 // Extended color palette (shown when expanded)
@@ -104,3 +107,13 @@ export const ALL_COLORS: ColorPreset[] = [...QUICK_COLORS, ...EXTENDED_COLORS];
 // Local storage keys
 export const RECENT_COLORS_KEY = 'bambuddy-recent-colors';
 export const MAX_RECENT_COLORS = 8;
+
+/**
+ * The nozzle sizes Bambu sells, smallest first.
+ *
+ * The spool form offers a filament preset and a K profile for every one of
+ * them, not only the size currently screwed into the machine: a spool is
+ * configured once and nozzles get swapped, and the calibration table on the
+ * printer keeps entries per diameter regardless of what is fitted right now.
+ */
+export const STANDARD_NOZZLE_DIAMETERS = ['0.2', '0.4', '0.6', '0.8'];

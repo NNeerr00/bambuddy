@@ -5,10 +5,10 @@ import zipfile
 from datetime import datetime
 from pathlib import Path
 
-from fastapi import APIRouter, Depends, File, UploadFile
+from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel, Field
-from sqlalchemy import delete, select
+from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from backend.app.core.auth import RequirePermissionIfAuthEnabled, caller_is_api_key, require_energy_cost_update
@@ -35,37 +35,93 @@ _SENSITIVE_FIELDS_FOR_API_KEY = (
 )
 
 
-def _sqlalchemy_type_to_sqlite_type(type_repr: str) -> str:
-    """Map a SQLAlchemy column type's ``str()`` to a SQLite-native column type.
-
-    Used by ``create_backup_zip`` to reconstruct a portable SQLite database
-    file from PostgreSQL data. Falling through to TEXT for binary columns
-    corrupts non-UTF8 bytes — the BLOB branch is the #1333 regression guard
-    for OIDC icon BLOBs.
-
-    Extracted as a pure helper so it can be unit-tested without spinning up
-    the full FastAPI app + backup pipeline.
-    """
-    type_str = type_repr.upper()
-    if "INT" in type_str:
-        return "INTEGER"
-    if "FLOAT" in type_str or "REAL" in type_str or "NUMERIC" in type_str:
-        return "REAL"
-    if "BOOL" in type_str:
-        return "BOOLEAN"
-    if "BLOB" in type_str or "BYTEA" in type_str or "BINARY" in type_str:
-        # OIDC icon BLOB column (#1333) — without this branch the column
-        # was created as TEXT and non-UTF8 bytes were corrupted during the
-        # PG→SQLite-ZIP backup round trip.
-        return "BLOB"
-    return "TEXT"
-
-
 async def get_setting(db: AsyncSession, key: str) -> str | None:
     """Get a single setting value by key."""
     result = await db.execute(select(Settings).where(Settings.key == key))
     setting = result.scalar_one_or_none()
     return setting.value if setting else None
+
+
+# Accepted spellings for a boolean settings value. Settings live in a VARCHAR
+# column and every reader compares them as strings, so these are normalised to
+# "true"/"false" on the way in. The sets are deliberately generous: these
+# endpoints are part of the documented REST surface, reached by scripts and by
+# Home Assistant rest_command, where "True", "1" and "on" are all natural.
+_TRUTHY_SETTING_VALUES = frozenset({"true", "1", "yes", "on"})
+_FALSY_SETTING_VALUES = frozenset({"false", "0", "no", "off"})
+
+
+def setting_is_true(value: object) -> bool:
+    """Return True if a *stored* settings value means "on".
+
+    Deliberately narrower than the spellings ``normalize_bool_setting`` accepts:
+    it matches only what every other reader in the codebase treats as on
+    (``value.lower() == "true"``). Submitted values are canonicalised on write,
+    so a stored value is always "true"/"false"/""; accepting "1" or "on" here
+    would make this function disagree with the rest of the app about any legacy
+    row containing them.
+
+    A bool is tolerated for the case of a row written before values were
+    normalised, where SQLite coerced a raw bool into the VARCHAR column.
+    """
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return str(value).strip().lower() == "true"
+
+
+def normalize_bool_setting(key: str, value: object) -> str:
+    """Coerce a boolean-ish settings value to the canonical "true"/"false".
+
+    Raises HTTPException(400) for values with no sensible interpretation, so an
+    API client gets a message naming the field instead of a 500.
+
+    A JSON boolean is the natural thing for an API client to send, and before
+    this normalisation it caused two distinct failures on
+    ``PUT /settings/spoolman``: ``bool.lower()`` raised AttributeError, and the
+    raw bool was written into a VARCHAR column, which SQLite silently coerces
+    to 1/0 while asyncpg rejects outright. Both surfaced as an opaque 500.
+    """
+    if isinstance(value, bool):  # must precede the int branch — bool is an int
+        return "true" if value else "false"
+    if isinstance(value, int):
+        if value in (0, 1):
+            return "true" if value else "false"
+        raise HTTPException(400, f"{key} must be a boolean; got the number {value}")
+    if isinstance(value, str):
+        candidate = value.strip().lower()
+        if not candidate:
+            # Empty is stored verbatim rather than normalised to "false".
+            # get_spoolman_settings reads these with ``or "<default>"``, so an
+            # empty stored value means "use the default" — and two of them
+            # (spoolman_report_partial_usage, auto_add_unknown_rfid) default to
+            # ON. Rewriting "" to "false" would silently switch them off for any
+            # client that submits a blank value.
+            return ""
+        if candidate in _TRUTHY_SETTING_VALUES:
+            return "true"
+        if candidate in _FALSY_SETTING_VALUES:
+            return "false"
+        raise HTTPException(400, f"{key} must be a boolean; got {value!r}")
+    raise HTTPException(400, f"{key} must be a boolean; got {type(value).__name__}")
+
+
+def normalize_str_setting(key: str, value: object) -> str:
+    """Return a string settings value, rejecting types that would store garbage.
+
+    ``str()`` on a dict or list would persist its repr, so those are refused
+    rather than silently written. Numbers are accepted and stringified: a port
+    or a bare host submitted unquoted is a plausible client mistake, not a
+    reason to fail the request.
+    """
+    if isinstance(value, str):
+        return value
+    if value is None:
+        return ""
+    if isinstance(value, bool | int | float):
+        return str(value)
+    raise HTTPException(400, f"{key} must be a string; got {type(value).__name__}")
 
 
 async def get_external_login_url(db: AsyncSession) -> str:
@@ -108,9 +164,11 @@ async def _build_settings_response(db: AsyncSession, is_api_key: bool = False) -
             "auto_archive",
             "save_thumbnails",
             "capture_finish_photo",
+            "finish_photo_restore_plate",
             "spoolman_enabled",
             "spoolman_disable_weight_sync",
             "spoolman_report_partial_usage",
+            "auto_add_unknown_rfid",
             "disable_filament_warnings",
             "prefer_lowest_filament",
             "check_updates",
@@ -127,15 +185,22 @@ async def _build_settings_response(db: AsyncSession, is_api_key: bool = False) -
             "queue_drying_enabled",
             "queue_drying_block",
             "ambient_drying_enabled",
+            "print_drying_enabled",
             "require_plate_clear",
             "queue_shortest_first",
-            "default_bed_levelling",
-            "default_flow_cali",
+            # default_bed_levelling / default_flow_cali / default_nozzle_offset_cali
+            # are tri-state strings (off/on/auto) — parsed via the raw-string else
+            # branch; the TriState validator coerces legacy "true"/"false" rows.
             "default_vibration_cali",
             "default_layer_inspect",
             "default_timelapse",
+            "billing_enabled",
+            "printer_kill_switch_enabled",
             "ldap_enabled",
             "ldap_auto_provision",
+            "local_login_enabled",
+            "preheat_enabled",
+            "queue_keep_bed_warm",
         ]:
             settings_dict[setting.key] = setting.value.lower() == "true"
         elif setting.key in [
@@ -148,9 +213,20 @@ async def _build_settings_response(db: AsyncSession, is_api_key: bool = False) -
         ]:
             settings_dict[setting.key] = float(setting.value)
         elif setting.key in [
+            # Nullable floats. Settings storage stringifies None to the literal
+            # "None", so these cannot go in the list above -- float("None")
+            # raises and would take the whole settings response with it (#2905).
+            "ams_temp_alarm",
+        ]:
+            try:
+                settings_dict[setting.key] = float(setting.value)
+            except (TypeError, ValueError):
+                settings_dict[setting.key] = None
+        elif setting.key in [
             "ams_humidity_good",
             "ams_humidity_fair",
             "ams_history_retention_days",
+            "printer_sensor_history_retention_days",
             "ftp_retry_count",
             "ftp_retry_delay",
             "ftp_timeout",
@@ -158,10 +234,24 @@ async def _build_settings_response(db: AsyncSession, is_api_key: bool = False) -
             "stagger_group_size",
             "stagger_interval_minutes",
             "forecast_global_lead_time_days",
+            "location_sensor_poll_interval",
+            "finance_budget_reset_day",
+            "session_max_hours",
+            "pipeline_max_copies",
+            "preheat_max_wait_seconds",
+            "preheat_soak_seconds",
+            "queue_keep_warm_bed_temp",
+            "queue_keep_warm_max_minutes",
+            "queue_max_concurrent_uploads",
         ]:
             settings_dict[setting.key] = int(setting.value)
         elif setting.key == "default_printer_id":
             settings_dict[setting.key] = int(setting.value) if setting.value and setting.value != "None" else None
+        elif setting.key == "open_in_slicer":
+            # None means "inherit from preferred_slicer" (#1329). The PUT path
+            # serializes None as the literal string "None"; strip it back so
+            # the frontend sees a true null and falls back as intended.
+            settings_dict[setting.key] = setting.value if setting.value and setting.value != "None" else None
         else:
             settings_dict[setting.key] = setting.value
 
@@ -194,10 +284,38 @@ async def get_settings(
 async def update_settings(
     settings_update: AppSettingsUpdate,
     db: AsyncSession = Depends(get_db),
-    _: User | None = RequirePermissionIfAuthEnabled(Permission.SETTINGS_UPDATE),
+    current_user: User | None = RequirePermissionIfAuthEnabled(Permission.SETTINGS_UPDATE),
 ):
     """Update application settings."""
     update_data = settings_update.model_dump(exclude_unset=True)
+
+    # Safety refusals on disabling local login (#1589). Two failure modes
+    # would otherwise lock everyone out of the install:
+    #   1. No enabled OIDC provider exists — nobody could authenticate.
+    #   2. The caller has no UserOIDCLink — they would lock themselves out
+    #      even if other admins are linked.
+    # Either case returns HTTP 400 instead of silently saving. The
+    # ``BAMBUDDY_LOCAL_LOGIN=true`` env-var bypass on /auth/login is a
+    # separate recovery path; the refusals here protect the *default*
+    # configuration where the env var is absent.
+    if update_data.get("local_login_enabled") is False:
+        from backend.app.models.oidc_provider import OIDCProvider, UserOIDCLink
+
+        enabled_count = await db.scalar(select(func.count(OIDCProvider.id)).where(OIDCProvider.is_enabled.is_(True)))
+        if not enabled_count:
+            raise HTTPException(
+                status_code=400,
+                detail="Cannot disable local login: no OIDC provider is enabled.",
+            )
+        if current_user is not None:
+            caller_links = await db.scalar(
+                select(func.count(UserOIDCLink.id)).where(UserOIDCLink.user_id == current_user.id)
+            )
+            if not caller_links:
+                raise HTTPException(
+                    status_code=400,
+                    detail="Cannot disable local login: your account has no OIDC link, so you would lock yourself out.",
+                )
 
     # Check if any MQTT settings are being updated
     mqtt_keys = {
@@ -334,11 +452,23 @@ _UI_PREFERENCE_FIELDS: tuple[str, ...] = (
     "time_format",
     "date_format",
     "drying_presets",
+    "ams_humidity_thresholds",
     "ams_humidity_good",
     "ams_humidity_fair",
     "ams_temp_good",
     "ams_temp_fair",
+    # ams_temp_alarm is deliberately NOT here. This endpoint is unauthenticated
+    # and exists so the UI can colour readings without SETTINGS_READ; the good /
+    # fair bands are what the printer card colours by. The alarm threshold
+    # changes no rendering anywhere -- only SettingsPage reads it, and that is
+    # behind the settings permissions already (#2905).
     "bed_cooled_threshold",
+    # Temperature / fan-speed presets for the printer-card popovers. Numbers
+    # only; no PII / credentials.
+    "nozzle_temp_presets",
+    "bed_temp_presets",
+    "chamber_temp_presets",
+    "fan_speed_presets",
 )
 
 
@@ -361,12 +491,20 @@ async def get_ui_preferences(db: AsyncSession = Depends(get_db)):
 
 
 @router.get("/check-ffmpeg")
-async def check_ffmpeg():
-    """Check if ffmpeg is installed and available."""
+async def check_ffmpeg(
+    _: User | None = RequirePermissionIfAuthEnabled(Permission.SETTINGS_READ),
+):
+    """Check if ffmpeg is installed and available.
+
+    Gated on ``SETTINGS_READ`` (audit finding I4 — the binary path was
+    leaking the host filesystem layout to unauthenticated callers).
+    ``require_permission_if_auth_enabled`` returns ``None`` only when
+    auth is disabled (in which case there's no privacy boundary to
+    enforce); otherwise it raises 401/403 before we get here.
+    """
     from backend.app.services.camera import get_ffmpeg_path
 
     ffmpeg_path = get_ffmpeg_path()
-
     return {
         "installed": ffmpeg_path is not None,
         "path": ffmpeg_path,
@@ -384,6 +522,7 @@ async def get_spoolman_settings(
     spoolman_sync_mode = await get_setting(db, "spoolman_sync_mode") or "auto"
     spoolman_disable_weight_sync = await get_setting(db, "spoolman_disable_weight_sync") or "false"
     spoolman_report_partial_usage = await get_setting(db, "spoolman_report_partial_usage") or "true"
+    auto_add_unknown_rfid = await get_setting(db, "auto_add_unknown_rfid") or "true"
 
     return {
         "spoolman_enabled": spoolman_enabled,
@@ -391,6 +530,7 @@ async def get_spoolman_settings(
         "spoolman_sync_mode": spoolman_sync_mode,
         "spoolman_disable_weight_sync": spoolman_disable_weight_sync,
         "spoolman_report_partial_usage": spoolman_report_partial_usage,
+        "auto_add_unknown_rfid": auto_add_unknown_rfid,
     }
 
 
@@ -400,39 +540,56 @@ async def update_spoolman_settings(
     db: AsyncSession = Depends(get_db),
     _: User | None = RequirePermissionIfAuthEnabled(Permission.SETTINGS_UPDATE),
 ):
-    """Update Spoolman integration settings."""
+    """Update Spoolman integration settings.
+
+    The body is a free-form dict rather than a schema, so each value is
+    normalised before it is persisted — see ``normalize_bool_setting`` for why
+    a JSON boolean used to produce a 500 here.
+    """
     if "spoolman_enabled" in settings:
-        old_val = await get_setting(db, "spoolman_enabled") or "false"
-        new_val = settings["spoolman_enabled"]
+        was_enabled = setting_is_true(await get_setting(db, "spoolman_enabled"))
+        new_val = normalize_bool_setting("spoolman_enabled", settings["spoolman_enabled"])
+        now_enabled = new_val == "true"
         await set_setting(db, "spoolman_enabled", new_val)
 
-        # Switching to Spoolman: clear built-in inventory slot assignments
-        if old_val.lower() != "true" and new_val.lower() == "true":
-            from backend.app.models.spool_assignment import SpoolAssignment
-
-            result = await db.execute(delete(SpoolAssignment))
-            logger.info("Cleared %d spool assignments on switch to Spoolman mode", result.rowcount)
-        # Switching back to internal mode: clear Spoolman slot assignments — the
-        # symmetric counterpart of the clear above. Without this, stale
-        # spoolman_slot_assignments rows linger and would wrongly count as
-        # "assigned" in any mode-agnostic check (e.g. the missing-spool-
-        # assignment notification, which unions both tables — #1473).
-        elif old_val.lower() == "true" and new_val.lower() != "true":
-            from backend.app.models.spoolman_slot_assignment import SpoolmanSlotAssignment
-
-            result = await db.execute(delete(SpoolmanSlotAssignment))
-            logger.info("Cleared %d Spoolman slot assignments on switch to internal mode", result.rowcount)
+        # Nothing is deleted on a mode change (#2812). Each mode keeps its slot
+        # assignments in its own table, so both can hold rows at once and the
+        # toggle is reversible: switching to Spoolman to see what it does, then
+        # switching back, returns you to the assignments you had.
+        #
+        # This used to empty the other mode's table on every toggle. The reason
+        # was real -- checks that read both tables would let a row in the mode
+        # you are not using answer for the mode you are -- but the cost was that
+        # inspecting a mode destroyed your configuration, with no confirmation
+        # and no way back, and the deletion was unfiltered across every printer.
+        # The readers that could be confused now ask which mode is active
+        # (``spoolman_owns_assignments``), which is where that decision belongs:
+        # the mode is a property of the install, not of the rows.
+        if was_enabled != now_enabled:
+            logger.info(
+                "Inventory mode switched to %s; slot assignments in both tables kept",
+                "Spoolman" if now_enabled else "built-in",
+            )
     if "spoolman_url" in settings:
-        await set_setting(db, "spoolman_url", settings["spoolman_url"])
+        await set_setting(db, "spoolman_url", normalize_str_setting("spoolman_url", settings["spoolman_url"]))
     if "spoolman_sync_mode" in settings:
-        await set_setting(db, "spoolman_sync_mode", settings["spoolman_sync_mode"])
-    if "spoolman_disable_weight_sync" in settings:
-        await set_setting(db, "spoolman_disable_weight_sync", settings["spoolman_disable_weight_sync"])
-    if "spoolman_report_partial_usage" in settings:
-        await set_setting(db, "spoolman_report_partial_usage", settings["spoolman_report_partial_usage"])
+        await set_setting(
+            db, "spoolman_sync_mode", normalize_str_setting("spoolman_sync_mode", settings["spoolman_sync_mode"])
+        )
+    for bool_key in ("spoolman_disable_weight_sync", "spoolman_report_partial_usage", "auto_add_unknown_rfid"):
+        if bool_key in settings:
+            await set_setting(db, bool_key, normalize_bool_setting(bool_key, settings[bool_key]))
+
+    spoolman_changed = "spoolman_enabled" in settings or "spoolman_url" in settings
 
     await db.commit()
     db.expire_all()
+
+    if spoolman_changed:
+        from backend.app.services.location_service import maybe_sync_spoolman_locations
+
+        if await maybe_sync_spoolman_locations(db):
+            await db.commit()
 
     # Return updated settings
     return await get_spoolman_settings(db)
@@ -512,25 +669,31 @@ async def create_backup_zip(output_path: Path | None = None) -> tuple[Path, str]
             import json
             import sqlite3
 
+            from sqlalchemy import create_engine as create_sync_engine
+
             from backend.app.core.database import Base, engine
 
             backup_db_path = temp_path / "bambuddy.db"
-            dst = sqlite3.connect(str(backup_db_path))
             metadata = Base.metadata
 
-            # Create tables in SQLite backup (simplified — just column names and types)
-            for table in metadata.sorted_tables:
-                cols = []
-                pk_cols = [col.name for col in table.columns if col.primary_key]
-                for col in table.columns:
-                    col_type = _sqlalchemy_type_to_sqlite_type(str(col.type))
-                    # Only inline PRIMARY KEY for single-column PKs
-                    pk = " PRIMARY KEY" if col.primary_key and len(pk_cols) == 1 else ""
-                    cols.append(f"{col.name} {col_type}{pk}")
-                # Add composite primary key constraint if needed
-                if len(pk_cols) > 1:
-                    cols.append(f"PRIMARY KEY ({', '.join(pk_cols)})")
-                dst.execute(f"CREATE TABLE IF NOT EXISTS {table.name} ({', '.join(cols)})")  # noqa: S608
+            # Build the portable SQLite schema with SQLAlchemy's own DDL rather
+            # than a hand-rolled CREATE TABLE. metadata.create_all() emits the
+            # exact schema a native SQLite install gets — NOT NULL, DEFAULT
+            # (server_default=func.now() → CURRENT_TIMESTAMP), foreign keys,
+            # unique constraints and indexes. The previous name+type-only
+            # rebuild dropped all of these, so a Postgres→SQLite restore left
+            # server_default columns (e.g. spoolbuddy_devices.created_at) with
+            # no DEFAULT — SQLAlchemy omits such columns on INSERT and the DB
+            # then wrote NULL, which 500'd on the next read (#2526). Using the
+            # real DDL also keeps the #1333 BLOB guard: LargeBinary still
+            # renders as BLOB, so OIDC icon bytes survive the round trip.
+            schema_engine = create_sync_engine(f"sqlite:///{backup_db_path}")
+            try:
+                metadata.create_all(schema_engine)
+            finally:
+                schema_engine.dispose()
+
+            dst = sqlite3.connect(str(backup_db_path))
 
             # Export data from Postgres to SQLite
             async with engine.connect() as conn:
@@ -565,7 +728,9 @@ async def create_backup_zip(output_path: Path | None = None) -> tuple[Path, str]
         for name, src_dir in dirs_to_backup:
             if src_dir.exists() and any(src_dir.iterdir()):
                 try:
-                    shutil.copytree(src_dir, temp_path / name)
+                    shutil.copytree(
+                        src_dir, temp_path / name
+                    )  # SEC-PATH-OK: name iterates the dirs_to_backup tuple of constant strings ("archive", "virtual_printer", ...)
                 except shutil.Error as e:
                     logger.warning("Some files in %s could not be copied: %s", name, e)
                 except PermissionError as e:
@@ -591,7 +756,9 @@ async def create_backup_zip(output_path: Path | None = None) -> tuple[Path, str]
 
         # Create ZIP
         if output_path is not None:
-            zip_file = output_path / filename
+            zip_file = (
+                output_path / filename
+            )  # SEC-PATH-OK: filename = f"bambuddy-backup-{datetime.now()...}.zip" generated in create_backup_zip itself
         else:
             fd, tmp = tempfile.mkstemp(suffix=".zip")
             os.close(fd)
@@ -666,16 +833,18 @@ async def _import_sqlite_to_postgres(sqlite_path: Path, postgres_url: str):
         sorted_tables = [t.name for t in metadata.sorted_tables if t.name in tables_to_import]
 
         # Phase 1: Drop all tables and recreate WITHOUT foreign keys.
-        # This avoids all FK ordering/orphan issues during import.
-        saved_fks = {}
-        for table in metadata.sorted_tables:
-            fks = list(table.foreign_key_constraints)
-            if fks:
-                saved_fks[table.name] = fks
-                for fk in fks:
-                    table.constraints.discard(fk)
-
+        # This avoids all FK ordering/orphan issues during import; the
+        # constraints go back on at the end, once every row has landed.
         async with pg_engine.begin() as conn:
+            # Cap how long DROP TABLE will wait for AccessExclusiveLock so
+            # any residual concurrent writer (per-printer MQTT clients
+            # writing reactively, an AMS history recorder firing on its
+            # hourly cadence) surfaces a fast `lock_timeout` error instead
+            # of blocking the restore for 30 s or producing a deadlock.
+            # SET LOCAL scopes to this transaction only; outside this
+            # restore path the global default (no timeout) applies.
+            await conn.execute(text("SET LOCAL lock_timeout = '10s'"))
+
             # Drop every existing table in the public schema with CASCADE
             # rather than `metadata.drop_all`. Two reasons:
             #   1. The user's live DB may carry orphan tables from removed
@@ -698,11 +867,38 @@ async def _import_sqlite_to_postgres(sqlite_path: Path, postgres_url: str):
             )
             await conn.run_sync(metadata.create_all)
 
-        # Restore FK definitions in metadata (needed for re-adding later)
-        for table_name, fks in saved_fks.items():
-            table_obj = metadata.tables[table_name]
-            for fk in fks:
-                table_obj.constraints.add(fk)
+            # Now strip the foreign keys, at the database level.
+            #
+            # This used to be done by discarding each ForeignKeyConstraint
+            # from `table.constraints` before `create_all`. That only
+            # suppresses the inline REFERENCES clause inside CREATE TABLE:
+            # `Table.foreign_key_constraints` is derived from the *columns'*
+            # ForeignKey objects, which the discard never touched. When
+            # `create_all` meets a dependency cycle it can't sort -- and
+            # library_files / library_folders / print_archives are exactly
+            # such a cycle -- it falls back to emitting those tables' keys
+            # as separate ALTER TABLE ... ADD FOREIGN KEY statements read
+            # straight from that property. Twelve constraints survived,
+            # including library_files.folder_id, and because the same cycle
+            # also drops the ordering edge from `sorted_tables` the child
+            # table was imported before its parent and the restore died on
+            # a ForeignKeyViolationError.
+            #
+            # Dropping them from pg_constraint instead is indifferent to how
+            # create_all chose to emit them, so a future model cycle cannot
+            # reintroduce this. It also keeps the app's global Base.metadata
+            # untouched: the old code only put the constraints back *after*
+            # the transaction, so a failure in here left the running process
+            # with an FK-less metadata until restart.
+            await conn.execute(
+                text(
+                    "DO $$ DECLARE r RECORD; BEGIN "
+                    "FOR r IN (SELECT conrelid::regclass AS tbl, conname FROM pg_constraint "
+                    "WHERE contype = 'f' AND connamespace = 'public'::regnamespace) LOOP "
+                    "EXECUTE 'ALTER TABLE ' || r.tbl || ' DROP CONSTRAINT ' || quote_ident(r.conname); "
+                    "END LOOP; END $$;"
+                )
+            )
 
         # Phase 2: Import data (no FKs to worry about)
         async with pg_engine.begin() as conn:
@@ -800,7 +996,7 @@ async def _import_sqlite_to_postgres(sqlite_path: Path, postgres_url: str):
         src.close()
         logger.info("Cross-database import complete: %d tables imported", len(tables_to_import))
 
-        # Recreate FK constraints from ORM metadata (not from saved definitions).
+        # Recreate FK constraints from ORM metadata, which Phase 1 left intact.
         # Use individual transactions so orphaned SQLite data doesn't block valid FKs.
         from sqlalchemy.schema import AddConstraint
 
@@ -810,11 +1006,28 @@ async def _import_sqlite_to_postgres(sqlite_path: Path, postgres_url: str):
                 try:
                     async with pg_engine.begin() as fk_conn:
                         await fk_conn.execute(AddConstraint(fk))
-                except Exception:
-                    failed_fks.append(f"{table.name}.{fk.name}")
+                except Exception as e:
+                    # Name the constraint by what it links, not by `fk.name`:
+                    # these are unnamed in the ORM, so that field is None and
+                    # the warning used to read "print_archives.None" for every
+                    # one of the five keys on that table -- unusable for
+                    # working out which rows to go and look at.
+                    cols = ", ".join(c.name for c in fk.columns)
+                    target = fk.elements[0].target_fullname if fk.elements else "unknown"
+                    failed_fks.append(f"{table.name}({cols}) -> {target}")
+                    # Postgres puts the offending key in a DETAIL line; it
+                    # names the exact orphan value, which is the one thing
+                    # that turns this into an actionable report.
+                    detail = next(
+                        (ln.strip() for ln in str(e).splitlines() if ln.startswith("DETAIL:")),
+                        str(e).splitlines()[0] if str(e) else e.__class__.__name__,
+                    )
+                    logger.info("FK %s(%s) -> %s not restored: %s", table.name, cols, target, detail)
         if failed_fks:
             logger.warning(
-                "Could not restore %d FK constraints (orphaned data in SQLite): %s",
+                "Could not restore %d FK constraints (orphaned data in the backup): %s. "
+                "The data is restored and usable; those columns are simply no longer "
+                "enforced. See the INFO lines above for the offending key in each case.",
                 len(failed_fks),
                 ", ".join(failed_fks),
             )
@@ -861,7 +1074,9 @@ async def restore_backup(
                     # Reject path-traversal payloads: any entry whose resolved
                     # path escapes temp_path would allow writing arbitrary files
                     # on the host (ZipSlip / CVE-2006-5456).
-                    dest = (temp_path / name).resolve()
+                    dest = (
+                        temp_path / name
+                    ).resolve()  # SEC-PATH-OK: is_relative_to containment check below before extractall
                     # is_relative_to (Python 3.9+) covers both relative
                     # path-traversal (../etc/passwd) and absolute-path overrides
                     # (/etc/passwd) — str.startswith was vulnerable to
@@ -889,6 +1104,33 @@ async def restore_backup(
                     await asyncio.sleep(1)
             except Exception as e:
                 logger.warning("Failed to stop virtual printer: %s", e)
+
+            # 3b. Pause timer-based background services BEFORE the DB swap.
+            # close_all_connections() below only disposes the engine's pool,
+            # not the asyncio tasks that opened sessions from it. The print
+            # scheduler (30 s cadence), smart-plug snapshot loop (30 s), and
+            # notification digest loop all
+            # wake up and call async_session(), which lazily re-creates a
+            # pool connection holding RowExclusiveLock on print_queue /
+            # smart_plug_energy_snapshots / etc. The DROP TABLE CASCADE
+            # pass in the PostgreSQL restore path needs AccessExclusiveLock
+            # on every public table, producing an AB/BA deadlock and a
+            # full restore rollback. Successful restore already requires a
+            # container restart, so we don't restart the services here.
+            try:
+                from backend.app.services.notification_service import notification_service
+                from backend.app.services.print_scheduler import scheduler as print_scheduler
+                from backend.app.services.smart_plug_manager import smart_plug_manager
+
+                logger.info("Pausing background services for restore...")
+                print_scheduler.stop()
+                smart_plug_manager.stop_scheduler()
+                notification_service.stop_digest_scheduler()
+                # In-flight loop iterations need a moment to commit + release
+                # their DB sessions before we dispose() the engine pool.
+                await asyncio.sleep(1.0)
+            except Exception as e:
+                logger.warning("Could not cleanly pause background services: %s", e)
 
             # 4. Close current database connections
             logger.info("Closing database connections...")
@@ -995,7 +1237,9 @@ async def restore_backup(
 
             skipped_dirs = []
             for name, dest_dir in dirs_to_restore:
-                src_dir = temp_path / name
+                src_dir = (
+                    temp_path / name
+                )  # SEC-PATH-OK: name iterates the dirs_to_restore tuple of constant strings ("archive", "virtual_printer", ...)
                 if src_dir.exists():
                     logger.info("Restoring %s directory...", name)
                     try:
@@ -1108,10 +1352,14 @@ async def get_virtual_printer_settings(
     tailscale_disabled_raw = await get_setting(db, "virtual_printer_tailscale_disabled")
     archive_name_source = await get_setting(db, "virtual_printer_archive_name_source")
 
+    from backend.app.models.virtual_printer import VP_MODE_ARCHIVE, normalize_vp_mode
+
     return {
         "enabled": enabled == "true" if enabled else False,
         "access_code_set": bool(access_code),
-        "mode": mode or "immediate",
+        # Normalize on read so older settings rows (with `immediate` /
+        # `print_queue`) come out as `archive` / `queue` for the frontend.
+        "mode": normalize_vp_mode(mode) or VP_MODE_ARCHIVE,
         "model": model or DEFAULT_VIRTUAL_PRINTER_MODEL,
         "target_printer_id": int(target_printer_id) if target_printer_id else None,
         "remote_interface_ip": remote_interface_ip or "",
@@ -1152,7 +1400,9 @@ async def update_virtual_printer_settings(
     # Get current values
     current_enabled = await get_setting(db, "virtual_printer_enabled") == "true"
     current_access_code = await get_setting(db, "virtual_printer_access_code") or ""
-    current_mode = await get_setting(db, "virtual_printer_mode") or "immediate"
+    # Default to `archive` (the canonical name) but tolerate legacy `immediate`
+    # in the stored value — normalized later before validation.
+    current_mode = await get_setting(db, "virtual_printer_mode") or "archive"
     current_model = await get_setting(db, "virtual_printer_model") or DEFAULT_VIRTUAL_PRINTER_MODEL
     current_target_id_str = await get_setting(db, "virtual_printer_target_printer_id")
     current_target_id = int(current_target_id_str) if current_target_id_str else None
@@ -1170,15 +1420,21 @@ async def update_virtual_printer_settings(
     new_remote_iface = remote_interface_ip if remote_interface_ip is not None else current_remote_iface
     new_ts_disabled = tailscale_disabled if tailscale_disabled is not None else current_ts_disabled
 
-    # Validate mode
-    # "review" is the new name for "queue" (pending review before archiving)
-    # "print_queue" archives and adds to print queue (unassigned)
-    # "proxy" is transparent TCP proxy to a real printer
-    if new_mode not in ("immediate", "queue", "review", "print_queue", "proxy"):
+    # Validate mode. Canonical wire values are `archive` / `review` / `queue`
+    # / `proxy`; legacy `immediate` and `print_queue` are accepted as aliases
+    # and translated before storage so support bundles stop showing the old
+    # confusing pair (#1429 mode-label discrepancy).
+    from backend.app.models.virtual_printer import VP_MODE_VALUES, normalize_vp_mode
+
+    canonical_mode = normalize_vp_mode(new_mode)
+    if canonical_mode not in VP_MODE_VALUES:
         return JSONResponse(
             status_code=400,
-            content={"detail": "Mode must be 'immediate', 'review', 'print_queue', or 'proxy'"},
+            content={
+                "detail": f"Mode must be one of: {', '.join(VP_MODE_VALUES)}",
+            },
         )
+    new_mode = canonical_mode
 
     # Validate archive_name_source
     if archive_name_source is not None and archive_name_source not in ("metadata", "filename"):
@@ -1186,9 +1442,6 @@ async def update_virtual_printer_settings(
             status_code=400,
             content={"detail": "archive_name_source must be 'metadata' or 'filename'"},
         )
-    # Normalize legacy "queue" to "review" for storage
-    if new_mode == "queue":
-        new_mode = "review"
 
     # Validate model
     if model is not None and model not in VIRTUAL_PRINTER_MODELS:

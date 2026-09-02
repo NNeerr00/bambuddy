@@ -1,31 +1,46 @@
 import { useState, useMemo, useEffect, useRef, useCallback, type ReactNode } from 'react';
 import { useSearchParams } from 'react-router-dom';
-import { useQuery, useMutation, useQueryClient } from '@tanstack/react-query';
+import { useQuery, useQueries, useMutation, useQueryClient } from '@tanstack/react-query';
 import { useTranslation } from 'react-i18next';
 import {
   Plus, Loader2, Trash2, Archive, RotateCcw, Edit2, Package,
   Search, ChevronLeft, ChevronRight, ChevronsLeft, ChevronsRight,
   TrendingDown, Layers, Printer, AlertTriangle, X, Clock, LayoutGrid, TableProperties, Columns,
-  ArrowUp, ArrowDown, ArrowUpDown, Group, ChevronDown, Check, RefreshCw, TrendingUp, Lock, Copy, Eraser,
+  ArrowUp, ArrowDown, ArrowUpDown, Group, ChevronDown, Check, RefreshCw, TrendingUp, Lock, Copy, Eraser, MapPin,
+  Upload, Download,
 } from 'lucide-react';
 import { ForecastPanel } from '../components/ForecastPanel';
 import { api, spoolbuddyApi, ApiError } from '../api/client';
-import type { InventorySpool, SpoolCatalogEntry } from '../api/client';
+import type { InventorySpool, SpoolCatalogEntry, LocationHASensorReading } from '../api/client';
 import { Button } from '../components/Button';
 import { FilamentSwatch } from '../components/FilamentSwatch';
+import { describeHASensorReading, iconForHASensor } from '../utils/haSensorDisplay';
 import { buildFilamentBackground } from '../components/filamentSwatchHelpers';
 import {SpoolFormModal, type SpoolFormMode} from '../components/SpoolFormModal';
 import { ConfirmModal } from '../components/ConfirmModal';
 import { ColumnConfigModal, type ColumnConfig } from '../components/ColumnConfigModal';
 import { LabelTemplatePickerModal } from '../components/LabelTemplatePickerModal';
+import { SpoolCsvImportModal } from '../components/SpoolCsvImportModal';
+import { LocationsModal } from '../components/LocationsModal';
+import { BulkEditSpoolsModal } from '../components/BulkEditSpoolsModal';
 import { useToast } from '../contexts/ToastContext';
 import { useAuth } from '../contexts/AuthContext';
-import { resolveSpoolColorName } from '../utils/colors';
+import { colorSortKey, resolveSpoolColorName } from '../utils/colors';
 import { getCurrencySymbol } from '../utils/currency';
 import { formatDateInput, parseUTCDate, type DateFormat } from '../utils/date';
 import { formatSlotLabel } from '../utils/amsHelpers';
 import { filterSpoolsByQuery } from '../utils/inventorySearch';
+import {
+  inventoryLocationsQueryKey,
+  invalidateSpoolAndLocationQueries,
+} from '../utils/inventoryQueries';
 import { aggregateGroupSpool } from '../utils/inventoryGrouping';
+import {
+  locationSensorReadingAlertStatus,
+  locationSensorValueColorClass,
+  useLocationSensorColorPrefs,
+  type LocationSensorAlertColor,
+} from '../utils/locationSensorDefaults';
 
 type ArchiveFilter = 'active' | 'archived';
 type UsageFilter = 'all' | 'used' | 'new' | 'lowstock';
@@ -36,6 +51,17 @@ type SortState = { column: string; direction: SortDirection } | null;
 type DisplayItem =
   | { type: 'single'; spool: InventorySpool }
   | { type: 'group'; key: string; spools: InventorySpool[]; representative: InventorySpool };
+
+function dedupeAndSort(values: Array<string | null | undefined>): string[] {
+  const set = new Set<string>();
+  for (const v of values) {
+    if (typeof v === 'string') {
+      const trimmed = v.trim();
+      if (trimmed) set.add(trimmed);
+    }
+  }
+  return Array.from(set).sort((a, b) => a.localeCompare(b));
+}
 
 function spoolGroupKey(s: InventorySpool): string {
   // Include extra_colors + effect_type so the "Group similar" toggle does
@@ -60,6 +86,9 @@ const DEFAULT_COLUMNS: ColumnConfig[] = [
   { id: 'slicer_filament', label: 'Slicer Filament', visible: false },
   { id: 'location', label: 'Location', visible: true },
   { id: 'storage_location', label: 'Storage Location', visible: false },
+  { id: 'temperature', label: 'Temperature', visible: false },
+  { id: 'humidity', label: 'Humidity', visible: false },
+  { id: 'battery', label: 'Battery', visible: false },
   { id: 'label_weight', label: 'Label', visible: true },
   { id: 'net', label: 'Net', visible: true },
   { id: 'gross', label: 'Gross', visible: false },
@@ -88,9 +117,21 @@ function loadColumnConfig(): ColumnConfig[] {
       const storedIds = new Set(parsed.map((c) => c.id));
       // Keep stored columns that still exist in defaults
       const validStored = parsed.filter((c) => defaultIds.has(c.id));
-      // Add any new default columns not in stored config
-      const newColumns = DEFAULT_COLUMNS.filter((c) => !storedIds.has(c.id));
-      return [...validStored, ...newColumns];
+      const merged = [...validStored];
+      for (const col of DEFAULT_COLUMNS) {
+        if (storedIds.has(col.id)) continue;
+        const defaultIndex = DEFAULT_COLUMNS.indexOf(col);
+        let insertAt = merged.length;
+        for (let i = defaultIndex - 1; i >= 0; i--) {
+          const idx = merged.findIndex((c) => c.id === DEFAULT_COLUMNS[i].id);
+          if (idx !== -1) {
+            insertAt = idx + 1;
+            break;
+          }
+        }
+        merged.splice(insertAt, 0, col);
+      }
+      return merged;
     }
   } catch {
     // Ignore errors
@@ -113,14 +154,14 @@ function formatWeight(g: number, useKg = false): string {
 
 // Material color mapping for pills
 const MATERIAL_COLORS: Record<string, string> = {
-  PLA: 'bg-green-500/20 text-green-400',
-  ABS: 'bg-red-500/20 text-red-400',
-  PETG: 'bg-blue-500/20 text-blue-400',
-  TPU: 'bg-purple-500/20 text-purple-400',
-  ASA: 'bg-orange-500/20 text-orange-400',
-  PA: 'bg-yellow-500/20 text-yellow-400',
-  PC: 'bg-cyan-500/20 text-cyan-400',
-  PET: 'bg-sky-500/20 text-sky-400',
+  PLA: 'bg-green-100 dark:bg-green-500/20 text-green-700 dark:text-green-400',
+  ABS: 'bg-red-100 dark:bg-red-500/20 text-red-700 dark:text-red-400',
+  PETG: 'bg-blue-100 dark:bg-blue-500/20 text-blue-700 dark:text-blue-400',
+  TPU: 'bg-purple-100 dark:bg-purple-500/20 text-purple-700 dark:text-purple-400',
+  ASA: 'bg-orange-100 dark:bg-orange-500/20 text-orange-700 dark:text-orange-400',
+  PA: 'bg-yellow-100 dark:bg-yellow-500/20 text-yellow-700 dark:text-yellow-400',
+  PC: 'bg-cyan-100 dark:bg-cyan-500/20 text-cyan-700 dark:text-cyan-400',
+  PET: 'bg-sky-100 dark:bg-sky-500/20 text-sky-700 dark:text-sky-400',
 };
 
 type TFn = (key: string, opts?: Record<string, unknown>) => string;
@@ -149,10 +190,15 @@ type CellCtx = {
   pct: number;
   assignmentMap: Record<number, LocationDisplay>;
   catalogMap: Record<number, SpoolCatalogEntry>;
+  locationReadingsMap: Record<number, LocationHASensorReading[]>;
   currencySymbol: string;
   dateFormat: DateFormat;
   t: TFn;
   onSyncWeight?: (spool: InventorySpool) => void;
+  colorizeLocationSensors: boolean;
+  locationSensorAboveColor: LocationSensorAlertColor;
+  locationSensorBelowColor: LocationSensorAlertColor;
+  locationSensorOptimalColor: LocationSensorAlertColor;
 };
 
 // Column header labels (25 columns — matching SpoolBuddy exactly)
@@ -169,6 +215,9 @@ const columnHeaders: Record<string, (t: TFn) => string> = {
   slicer_filament: (t) => t('inventory.slicerFilament'),
   location: () => 'Location',
   storage_location: (t) => t('inventory.storageLocation'),
+  temperature: (t) => t('inventory.temperature'),
+  humidity: (t) => t('inventory.humidity'),
+  battery: (t) => t('inventory.battery'),
   label_weight: (t) => t('inventory.labelWeight'),
   net: (t) => t('inventory.net'),
   gross: () => 'Gross',
@@ -238,7 +287,7 @@ const columnCells: Record<string, (ctx: CellCtx) => ReactNode> = {
     const isHt = !isExternal && assignment.ams_id >= 128;
     const slotLabel = formatSlotLabel(assignment.ams_id, assignment.tray_id, isHt, isExternal);
     return (
-      <span className="inline-flex items-center px-1.5 py-0.5 rounded text-xs font-medium bg-purple-500/20 text-purple-400">
+      <span className="inline-flex items-center px-1.5 py-0.5 rounded text-xs font-medium bg-purple-100 dark:bg-purple-500/20 text-purple-700 dark:text-purple-400">
         {printerLabel} {slotLabel}{assignment.ams_label ? ` (${assignment.ams_label})` : ''}
       </span>
     );
@@ -246,8 +295,50 @@ const columnCells: Record<string, (ctx: CellCtx) => ReactNode> = {
   storage_location: ({ spool }) => {
     if (!spool.storage_location) return <span className="text-sm text-bambu-gray">-</span>;
     return (
-      <span className="inline-flex items-center px-1.5 py-0.5 rounded text-xs font-medium bg-blue-500/20 text-blue-400">
+      <span className="inline-flex items-center px-1.5 py-0.5 rounded text-xs font-medium bg-blue-100 dark:bg-blue-500/20 text-blue-700 dark:text-blue-400">
         {spool.storage_location}
+      </span>
+    );
+  },
+  temperature: ({ spool, locationReadingsMap, t, colorizeLocationSensors, locationSensorAboveColor, locationSensorBelowColor, locationSensorOptimalColor }) => {
+    const reading = spool.location_id
+      ? locationReadingsMap[spool.location_id]?.find((r) => r.device_class === 'temperature')
+      : undefined;
+    if (!reading) return <span className="text-sm text-bambu-gray/50">-</span>;
+    return (
+      <span
+        title={reading.name}
+        className={`text-sm ${locationSensorCellColor(reading, colorizeLocationSensors, locationSensorAboveColor, locationSensorBelowColor, locationSensorOptimalColor)}`}
+      >
+        {describeLocationSensor(reading, t)}
+      </span>
+    );
+  },
+  humidity: ({ spool, locationReadingsMap, t, colorizeLocationSensors, locationSensorAboveColor, locationSensorBelowColor, locationSensorOptimalColor }) => {
+    const reading = spool.location_id
+      ? locationReadingsMap[spool.location_id]?.find((r) => r.device_class === 'humidity')
+      : undefined;
+    if (!reading) return <span className="text-sm text-bambu-gray/50">-</span>;
+    return (
+      <span
+        title={reading.name}
+        className={`text-sm ${locationSensorCellColor(reading, colorizeLocationSensors, locationSensorAboveColor, locationSensorBelowColor, locationSensorOptimalColor)}`}
+      >
+        {describeLocationSensor(reading, t)}
+      </span>
+    );
+  },
+  battery: ({ spool, locationReadingsMap, t, colorizeLocationSensors, locationSensorAboveColor, locationSensorBelowColor, locationSensorOptimalColor }) => {
+    const reading = spool.location_id
+      ? locationReadingsMap[spool.location_id]?.find((r) => r.device_class === 'battery')
+      : undefined;
+    if (!reading) return <span className="text-sm text-bambu-gray/50">-</span>;
+    return (
+      <span
+        title={reading.name}
+        className={`text-sm ${locationSensorCellColor(reading, colorizeLocationSensors, locationSensorAboveColor, locationSensorBelowColor, locationSensorOptimalColor)}`}
+      >
+        {describeLocationSensor(reading, t)}
       </span>
     );
   },
@@ -302,7 +393,7 @@ const columnCells: Record<string, (ctx: CellCtx) => ReactNode> = {
   stock: ({ spool, t }) => {
     if (!spool.slicer_filament) {
       return (
-        <span className="inline-flex items-center px-1.5 py-0.5 rounded text-xs font-medium bg-amber-500/20 text-amber-400">
+        <span className="inline-flex items-center px-1.5 py-0.5 rounded text-xs font-medium bg-amber-100 dark:bg-amber-500/20 text-amber-700 dark:text-amber-400">
           {t('inventory.stock')}
         </span>
       );
@@ -354,7 +445,7 @@ const columnCells: Record<string, (ctx: CellCtx) => ReactNode> = {
 
     return (
       <div
-        className={`flex items-center gap-1 text-sm font-medium ${isMatch ? 'text-green-400' : 'text-yellow-400'}`}
+        className={`flex items-center gap-1 text-sm font-medium ${isMatch ? 'text-green-700 dark:text-green-400' : 'text-yellow-700 dark:text-yellow-400'}`}
         title={tooltip}
       >
         <span>{Math.round(scaleWeight)}g</span>
@@ -385,7 +476,14 @@ const columnCells: Record<string, (ctx: CellCtx) => ReactNode> = {
 };
 
 // Sort value extractors — return a comparable value for each sortable column
-const columnSortValues: Record<string, (spool: InventorySpool, assignmentMap: Record<number, LocationDisplay>) => string | number> = {
+const columnSortValues: Record<
+  string,
+  (
+    spool: InventorySpool,
+    assignmentMap: Record<number, LocationDisplay>,
+    locationReadingsMap: Record<number, LocationHASensorReading[]>
+  ) => string | number
+> = {
   id: (s) => s.id,
   added_time: (s) => s.created_at || '',
   encode_time: (s) => s.encode_time || '',
@@ -393,6 +491,10 @@ const columnSortValues: Record<string, (spool: InventorySpool, assignmentMap: Re
   material: (s) => (s.material || '').toLowerCase(),
   subtype: (s) => (s.subtype || '').toLowerCase(),
   color_name: (s) => (s.color_name || '').toLowerCase(),
+  // Sorts the swatch column itself (#2729). Multi-colour spools sort on their
+  // primary colour — extra_colors are gradient stops, and a spool has to sit in
+  // exactly one place in the list.
+  rgba: (s) => colorSortKey(s.rgba),
   brand: (s) => (s.brand || '').toLowerCase(),
   slicer_filament: (s) => (s.slicer_filament_name || s.slicer_filament || '').toLowerCase(),
   location: (s, am) => {
@@ -419,6 +521,18 @@ const columnSortValues: Record<string, (spool: InventorySpool, assignmentMap: Re
     if (s.last_scale_weight == null) return -1;
     const expectedGross = Math.max(0, s.label_weight - s.weight_used) + s.core_weight;
     return Math.abs(s.last_scale_weight - expectedGross);
+  },
+  temperature: (s, _am, lrm) => {
+    const readings = s.location_id ? lrm[s.location_id] : undefined;
+    return readings?.find((r) => r.device_class === 'temperature')?.value ?? -Infinity;
+  },
+  humidity: (s, _am, lrm) => {
+    const readings = s.location_id ? lrm[s.location_id] : undefined;
+    return readings?.find((r) => r.device_class === 'humidity')?.value ?? -Infinity;
+  },
+  battery: (s, _am, lrm) => {
+    const readings = s.location_id ? lrm[s.location_id] : undefined;
+    return readings?.find((r) => r.device_class === 'battery')?.value ?? -Infinity;
   },
 };
 
@@ -467,12 +581,16 @@ function InventoryPage({ spoolmanMode = false, spoolmanModeReady = true }: { spo
   const [formModal, setFormModal] = useState<{ spool?: InventorySpool | null; mode: SpoolFormMode } | null>(null);
   const deepLinkHandled = useRef(false);
   const [confirmAction, setConfirmAction] = useState<
-    | { type: 'delete' | 'archive' | 'reset-usage'; spoolId: number }
-    | { type: 'reset-all-usage' }
+    | { type: 'delete' | 'archive' | 'reset-consumed-counter'; spoolId: number }
+    | { type: 'reset-all-consumed-counters' }
     | null
   >(null);
   // Label printing (#809). null = closed; otherwise the IDs to print labels for.
   const [labelPickerSpoolIds, setLabelPickerSpoolIds] = useState<number[] | null>(null);
+  // CSV import/export (#1576). Local inventory only — hidden in Spoolman mode.
+  const [csvImportOpen, setCsvImportOpen] = useState(false);
+  const [exportingCsv, setExportingCsv] = useState(false);
+  const [locationsModalOpen, setLocationsModalOpen] = useState(false);
 
   // Filter state
   const [archiveFilter, setArchiveFilter] = useState<ArchiveFilter>('active');
@@ -482,10 +600,6 @@ function InventoryPage({ spoolmanMode = false, spoolmanModeReady = true }: { spo
   const [categoryFilter, setCategoryFilter] = useState('');
   const [spoolFilter, setSpoolFilter] = useState('');
   const [stockFilter, setStockFilter] = useState<'all' | 'stock' | 'configured'>('all');
-  // #1400: storage-location dropdown. Uses the sentinel `__none__` for the
-  // "no storage location set" group, same pattern as the category filter so
-  // users can find unfiled spools.
-  const [storageLocationFilter, setStorageLocationFilter] = useState('');
   const [search, setSearch] = useState('');
   const [viewMode, setViewMode] = useState<ViewMode>('table');
   const [sortState, setSortState] = useState<SortState>(loadSortState);
@@ -497,6 +611,28 @@ function InventoryPage({ spoolmanMode = false, spoolmanModeReady = true }: { spo
     } catch { return false; }
   });
   const [expandedGroups, setExpandedGroups] = useState<Set<string>>(new Set());
+
+  // Bulk-selection state for batch actions on the spool list (#1795).
+  // Cleared when the user switches filter/tab/page because cross-page selection
+  // produces a confusing toolbar count vs. visible-row count delta.
+  const [selectedIds, setSelectedIds] = useState<Set<number>>(new Set());
+  const [bulkEditOpen, setBulkEditOpen] = useState(false);
+  const [bulkConfirmAction, setBulkConfirmAction] = useState<'delete' | 'archive' | 'restore' | 'reset-consumed-counter' | null>(null);
+  const toggleSelected = useCallback((id: number) => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }, []);
+  const clearSelection = useCallback(() => setSelectedIds(new Set()), []);
+
+  // Clear selection on any filter/tab change so the toolbar count stays
+  // honest vs. what the user is actually looking at.
+  useEffect(() => {
+    setSelectedIds(new Set());
+  }, [archiveFilter, usageFilter, materialFilter, brandFilter, categoryFilter, spoolFilter, stockFilter, search]);
 
   // Pagination state (pageSize persisted to localStorage)
   const [pageIndex, setPageIndex] = useState(0);
@@ -517,15 +653,58 @@ function InventoryPage({ spoolmanMode = false, spoolmanModeReady = true }: { spo
   });
 
   const dateFormat: DateFormat = settings?.date_format || 'system';
+  const locationSensorPollIntervalMs = (settings?.location_sensor_poll_interval || 120) * 1000;
+
+  const {
+    colorize: colorizeLocationSensors,
+    aboveColor: locationSensorAboveColor,
+    belowColor: locationSensorBelowColor,
+    optimalColor: locationSensorOptimalColor,
+  } = useLocationSensorColorPrefs();
 
   // Query key and fetch function differ based on data source
   const spoolsQueryKey = spoolmanMode ? ['spoolman-inventory-spools'] : ['inventory-spools'];
+  const refreshSpoolQueries = () => invalidateSpoolAndLocationQueries(queryClient, spoolsQueryKey);
   const { data: spools, isLoading } = useQuery({
     queryKey: spoolsQueryKey,
     queryFn: () =>
       spoolmanMode ? api.getSpoolmanInventorySpools(true) : api.getSpools(true),
     refetchInterval: 30000,
   });
+
+  // CSV export (#1576) — downloads the active inventory as a CSV file.
+  const handleExportCsv = useCallback(async () => {
+    setExportingCsv(true);
+    try {
+      await api.exportSpoolsCsv();
+    } catch (err) {
+      showToast(
+        err instanceof Error ? err.message : t('inventory.csv.exportError', 'Export failed'),
+        'error',
+      );
+    } finally {
+      setExportingCsv(false);
+    }
+  }, [showToast, t]);
+
+  // Shown as the tooltip on both CSV buttons when they're disabled in Spoolman mode.
+  const spoolmanCsvHint = spoolmanMode
+    ? t('inventory.csv.spoolmanHint', 'In Spoolman mode, use Spoolman\'s built-in CSV import/export.')
+    : undefined;
+
+  const { data: storageLocations = [] } = useQuery({
+    queryKey: inventoryLocationsQueryKey,
+    queryFn: api.getLocations,
+  });
+
+  // Deep-link / filter: ?location_id=<id> or ?location_id=__none__
+  const _rawLocationParam = searchParams.get('location_id');
+  const storageLocationFilter =
+    _rawLocationParam === '__none__'
+      ? '__none__'
+      : _rawLocationParam && /^\d+$/.test(_rawLocationParam) && Number(_rawLocationParam) > 0
+        ? _rawLocationParam
+        : '';
 
   // Deep-link: open edit modal for ?spool=<id>
   // Prefer the already-loaded spool list (no extra API call); fall back to a
@@ -637,7 +816,7 @@ function InventoryPage({ spoolmanMode = false, spoolmanModeReady = true }: { spo
     mutationFn: (id: number) =>
       spoolmanMode ? api.deleteSpoolmanInventorySpool(id) : api.deleteSpool(id),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: spoolsQueryKey });
+      refreshSpoolQueries();
       showToast(t('inventory.spoolDeleted'), 'success');
     },
     onError: (error: Error) => {
@@ -655,7 +834,7 @@ function InventoryPage({ spoolmanMode = false, spoolmanModeReady = true }: { spo
     mutationFn: (id: number) =>
       spoolmanMode ? api.archiveSpoolmanInventorySpool(id) : api.archiveSpool(id),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: spoolsQueryKey });
+      refreshSpoolQueries();
       showToast(t('inventory.spoolArchived'), 'success');
     },
     onError: (error: Error) => {
@@ -673,7 +852,7 @@ function InventoryPage({ spoolmanMode = false, spoolmanModeReady = true }: { spo
     mutationFn: (id: number) =>
       spoolmanMode ? api.restoreSpoolmanInventorySpool(id) : api.restoreSpool(id),
     onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: spoolsQueryKey });
+      refreshSpoolQueries();
       showToast(t('inventory.spoolRestored'), 'success');
     },
     onError: (error: Error) => {
@@ -687,27 +866,146 @@ function InventoryPage({ spoolmanMode = false, spoolmanModeReady = true }: { spo
     },
   });
 
-  const resetUsageMutation = useMutation({
+  const resetConsumedCounterMutation = useMutation({
     mutationFn: (id: number) =>
-      spoolmanMode ? api.resetSpoolmanInventorySpoolUsage(id) : api.resetSpoolUsage(id),
+      spoolmanMode
+        ? api.resetSpoolmanInventorySpoolConsumedCounter(id)
+        : api.resetSpoolConsumedCounter(id),
     onSuccess: () => {
       queryClient.invalidateQueries({ queryKey: spoolsQueryKey });
-      showToast(t('inventory.usageReset'), 'success');
+      showToast(t('inventory.consumedCounterReset'), 'success');
     },
     onError: () => {
-      showToast(t('inventory.resetUsageFailed'), 'error');
+      showToast(t('inventory.resetConsumedCounterFailed'), 'error');
     },
   });
 
-  const bulkResetUsageMutation = useMutation({
+  const bulkResetConsumedCounterMutation = useMutation({
     mutationFn: (ids: number[]) =>
-      spoolmanMode ? api.bulkResetSpoolmanInventorySpoolUsage(ids) : api.bulkResetSpoolUsage(ids),
+      spoolmanMode
+        ? api.bulkResetSpoolmanInventorySpoolConsumedCounter(ids)
+        : api.bulkResetSpoolConsumedCounter(ids),
     onSuccess: (data) => {
       queryClient.invalidateQueries({ queryKey: spoolsQueryKey });
-      showToast(t('inventory.allUsageReset', { count: data.reset }), 'success');
+      showToast(t('inventory.allConsumedCountersReset', { count: data.reset }), 'success');
+      // Close any open bulk-confirm modal + clear selection so the toolbar
+      // collapses after the action — matches the other three bulk mutations
+      // and stops the confirm dialog from lingering after Reset.
+      setBulkConfirmAction(null);
+      clearSelection();
     },
     onError: () => {
-      showToast(t('inventory.resetUsageFailed'), 'error');
+      showToast(t('inventory.resetConsumedCounterFailed'), 'error');
+    },
+  });
+
+  // Bulk action mutations (#1795). Each invalidates the same query keys as
+  // the per-spool equivalents so the table refreshes with the new state.
+  // Helper: count items that didn't succeed across the two response shapes
+  // (internal mode returns not_found, Spoolman returns errors[]). When the
+  // success count is 0 OR any failures occurred, surface that to the user
+  // instead of the silent green-toast-and-clear flow the first cut shipped.
+  const failedCount = (data: { not_found?: number[]; errors?: Array<{ id: number }> }): number =>
+    (data.not_found?.length ?? 0) + (data.errors?.length ?? 0);
+
+  const bulkUpdateMutation = useMutation({
+    mutationFn: async ({ ids, update }: { ids: number[]; update: Partial<Omit<InventorySpool, 'id' | 'archived_at' | 'created_at' | 'updated_at' | 'k_profiles'>> }): Promise<{ updated: number; not_found?: number[]; errors?: Array<{ id: number; status: number; detail: string }> }> => {
+      if (spoolmanMode) return api.bulkUpdateSpoolmanInventorySpools(ids, update);
+      return api.bulkUpdateSpools(ids, update);
+    },
+    onSuccess: (data) => {
+      refreshSpoolQueries();
+      const failed = failedCount(data);
+      if (data.updated === 0) {
+        showToast(t('inventory.bulk.updateAllFailed', { count: failed }), 'error');
+        return; // keep modal open + selection intact so user can retry
+      }
+      if (failed > 0) {
+        showToast(t('inventory.bulk.updatePartial', { ok: data.updated, failed }), 'warning');
+      } else {
+        showToast(t('inventory.bulk.updateSuccess', { count: data.updated }), 'success');
+      }
+      setBulkEditOpen(false);
+      clearSelection();
+    },
+    onError: (err: Error) => {
+      showToast(err.message || t('inventory.bulk.updateFailed'), 'error');
+    },
+  });
+
+  const bulkDeleteMutation = useMutation({
+    mutationFn: async (ids: number[]): Promise<{ deleted: number; not_found?: number[]; errors?: Array<{ id: number; status: number; detail: string }> }> => {
+      if (spoolmanMode) return api.bulkDeleteSpoolmanInventorySpools(ids);
+      return api.bulkDeleteSpools(ids);
+    },
+    onSuccess: (data) => {
+      refreshSpoolQueries();
+      const failed = failedCount(data);
+      if (data.deleted === 0) {
+        showToast(t('inventory.bulk.deleteAllFailed', { count: failed }), 'error');
+        return;
+      }
+      if (failed > 0) {
+        showToast(t('inventory.bulk.deletePartial', { ok: data.deleted, failed }), 'warning');
+      } else {
+        showToast(t('inventory.bulk.deleteSuccess', { count: data.deleted }), 'success');
+      }
+      setBulkConfirmAction(null);
+      clearSelection();
+    },
+    onError: (err: Error) => {
+      showToast(err.message || t('inventory.bulk.deleteFailed'), 'error');
+    },
+  });
+
+  const bulkArchiveMutation = useMutation({
+    mutationFn: async (ids: number[]): Promise<{ archived: number; already_archived?: number[]; not_found?: number[]; errors?: Array<{ id: number; status: number; detail: string }> }> => {
+      if (spoolmanMode) return api.bulkArchiveSpoolmanInventorySpools(ids);
+      return api.bulkArchiveSpools(ids);
+    },
+    onSuccess: (data) => {
+      refreshSpoolQueries();
+      // already-archived rows are NOT failures — they're correctly idempotent.
+      const failed = failedCount(data);
+      if (data.archived === 0 && failed > 0) {
+        showToast(t('inventory.bulk.archiveAllFailed', { count: failed }), 'error');
+        return;
+      }
+      if (failed > 0) {
+        showToast(t('inventory.bulk.archivePartial', { ok: data.archived, failed }), 'warning');
+      } else {
+        showToast(t('inventory.bulk.archiveSuccess', { count: data.archived }), 'success');
+      }
+      setBulkConfirmAction(null);
+      clearSelection();
+    },
+    onError: (err: Error) => {
+      showToast(err.message || t('inventory.bulk.archiveFailed'), 'error');
+    },
+  });
+
+  const bulkRestoreMutation = useMutation({
+    mutationFn: async (ids: number[]): Promise<{ restored: number; already_active?: number[]; not_found?: number[]; errors?: Array<{ id: number; status: number; detail: string }> }> => {
+      if (spoolmanMode) return api.bulkRestoreSpoolmanInventorySpools(ids);
+      return api.bulkRestoreSpools(ids);
+    },
+    onSuccess: (data) => {
+      refreshSpoolQueries();
+      const failed = failedCount(data);
+      if (data.restored === 0 && failed > 0) {
+        showToast(t('inventory.bulk.restoreAllFailed', { count: failed }), 'error');
+        return;
+      }
+      if (failed > 0) {
+        showToast(t('inventory.bulk.restorePartial', { ok: data.restored, failed }), 'warning');
+      } else {
+        showToast(t('inventory.bulk.restoreSuccess', { count: data.restored }), 'success');
+      }
+      setBulkConfirmAction(null);
+      clearSelection();
+    },
+    onError: (err: Error) => {
+      showToast(err.message || t('inventory.bulk.restoreFailed'), 'error');
     },
   });
 
@@ -857,6 +1155,58 @@ function InventoryPage({ spoolmanMode = false, spoolmanModeReady = true }: { spo
     return map;
   }, [catalogEntries]);
 
+  // Not polled — it only changes via explicit create/edit/delete, all of
+  // which already invalidate this key, and it also seeds the SpoolCard
+  // footers below (same query key, so they share this fetch instead of each
+  // issuing their own).
+  const { data: locationHaSensorsList } = useQuery({
+    queryKey: ['locationHaSensors'],
+    queryFn: () => api.getLocationHASensors(),
+  });
+
+  const locationIdsWithSensors = useMemo(
+    () => new Set((locationHaSensorsList ?? []).map((s) => s.location_id)),
+    [locationHaSensorsList]
+  );
+
+  const usedLocationIds = useMemo(() => {
+    const ids = new Set<number>();
+    for (const s of spools || []) {
+      // Skip locations with no bound sensor at all — polling them would only
+      // ever come back empty, and most installs have far more storage
+      // locations than ones actually wired up to Home Assistant.
+      if (s.location_id && locationIdsWithSensors.has(s.location_id)) ids.add(s.location_id);
+    }
+    return Array.from(ids);
+  }, [spools, locationIdsWithSensors]);
+
+  // Card view always needs readings (the SpoolCard footer below reads this
+  // same cache and filters to show_on_card itself); table view only needs
+  // them when a sensor column is actually visible, since the default
+  // column config hides all three.
+  const needsLocationReadings =
+    viewMode === 'cards' ||
+    (viewMode === 'table' &&
+      columnConfig.some((c) => c.visible && (c.id === 'temperature' || c.id === 'humidity' || c.id === 'battery')));
+
+  const locationReadingsQueries = useQueries({
+    queries: usedLocationIds.map((locationId) => ({
+      queryKey: ['locationHaSensorReadings', locationId],
+      queryFn: () => api.getLocationHASensorReadings(locationId, false),
+      refetchInterval: locationSensorPollIntervalMs,
+      enabled: needsLocationReadings,
+    })),
+  });
+
+  const locationReadingsMap = useMemo(() => {
+    const map: Record<number, LocationHASensorReading[]> = {};
+    usedLocationIds.forEach((locationId, i) => {
+      const data = locationReadingsQueries[i]?.data;
+      if (data) map[locationId] = data;
+    });
+    return map;
+  }, [usedLocationIds, locationReadingsQueries]);
+
   // Top materials by weight for stat card pills
   const topMaterials = useMemo(() => {
     if (!stats) return [];
@@ -919,9 +1269,15 @@ function InventoryPage({ spoolmanMode = false, spoolmanModeReady = true }: { spo
     // spools that haven't been assigned a storage location yet.
     if (storageLocationFilter) {
       if (storageLocationFilter === '__none__') {
-        filtered = filtered.filter((s) => !s.storage_location?.trim());
+        filtered = filtered.filter((s) => !s.location_id && !s.storage_location?.trim());
       } else {
-        filtered = filtered.filter((s) => s.storage_location?.trim() === storageLocationFilter);
+        const locId = Number(storageLocationFilter);
+        const locName = storageLocations.find((l) => l.id === locId)?.name?.trim().toLowerCase();
+        filtered = filtered.filter((s) => {
+          if (s.location_id != null) return s.location_id === locId;
+          if (locName) return (s.storage_location || '').trim().toLowerCase() === locName;
+          return false;
+        });
       }
     }
 
@@ -938,10 +1294,21 @@ function InventoryPage({ spoolmanMode = false, spoolmanModeReady = true }: { spo
     }
 
     return filtered;
-  }, [spools, archiveFilter, usageFilter, materialFilter, brandFilter, categoryFilter, spoolFilter, stockFilter, storageLocationFilter, search, lowStockThreshold]);
+  }, [spools, archiveFilter, usageFilter, materialFilter, brandFilter, categoryFilter, spoolFilter, stockFilter, storageLocationFilter, search, lowStockThreshold, storageLocations]);
 
   // Reset page on filter changes
   const resetPage = () => setPageIndex(0);
+
+  const setStorageLocationFilter = useCallback((value: string) => {
+    setSearchParams((prev) => {
+      prev.delete('location_id');
+      if (value) {
+        prev.set('location_id', value);
+      }
+      return prev;
+    }, { replace: true });
+    resetPage();
+  }, [setSearchParams]);
 
   // Unique values for filter dropdowns
   const uniqueMaterials = [...new Set(spools?.map((s) => s.material) || [])].sort();
@@ -955,8 +1322,7 @@ function InventoryPage({ spoolmanMode = false, spoolmanModeReady = true }: { spo
   });
   // #1400: storage-location distinct values. `.trim()` so accidental
   // trailing whitespace doesn't show up as a separate option.
-  const uniqueStorageLocations = [...new Set(spools?.map((s) => s.storage_location?.trim()).filter(Boolean) as string[] || [])].sort();
-  const hasUnsetStorageLocation = (spools ?? []).some((s) => !s.storage_location?.trim());
+  const hasUnsetStorageLocation = (spools ?? []).some((s) => !s.location_id && !s.storage_location?.trim());
 
   // Check if any filters are non-default
   const hasActiveFilters = archiveFilter !== 'active' || usageFilter !== 'all' || !!materialFilter || !!brandFilter || !!categoryFilter || !!spoolFilter || !!storageLocationFilter || stockFilter !== 'all' || !!search;
@@ -994,14 +1360,14 @@ function InventoryPage({ spoolmanMode = false, spoolmanModeReady = true }: { spo
     const extractor = columnSortValues[sortState.column];
     if (!extractor) return filteredSpools;
     const sorted = [...filteredSpools].sort((a, b) => {
-      const va = extractor(a, assignmentMap);
-      const vb = extractor(b, assignmentMap);
+      const va = extractor(a, assignmentMap, locationReadingsMap);
+      const vb = extractor(b, assignmentMap, locationReadingsMap);
       if (va < vb) return sortState.direction === 'asc' ? -1 : 1;
       if (va > vb) return sortState.direction === 'asc' ? 1 : -1;
       return 0;
     });
     return sorted;
-  }, [filteredSpools, sortState, assignmentMap]);
+  }, [filteredSpools, sortState, assignmentMap, locationReadingsMap]);
 
   // Group similar spools when toggle is active
   const displayItems = useMemo((): DisplayItem[] => {
@@ -1082,16 +1448,24 @@ function InventoryPage({ spoolmanMode = false, spoolmanModeReady = true }: { spo
     setBrandFilter('');
     setCategoryFilter('');
     setSpoolFilter('');
-    setStorageLocationFilter('');
     setStockFilter('all');
     setSearch('');
+    setSearchParams((prev) => {
+      prev.delete('location_id');
+      return prev;
+    }, { replace: true });
     resetPage();
   };
 
   return (
     <div className="p-4 md:p-8 space-y-6">
-      {/* Header */}
-      <div className="flex items-center justify-between">
+      {/* Header. Stacks below sm and the actions wrap (#2813): five buttons
+          side by side are ~600px, and nothing in that row can shrink, so on a
+          phone the header pushed past the viewport and took the whole page
+          with it -- <main> is the scroll container, so everything inside it
+          panned sideways. Same pattern the Statistics, Settings and Archives
+          headers use, and the filter bar further down this page. */}
+      <div className="flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
         <div>
           <h1 className="text-2xl font-bold text-white flex items-center gap-3">
             <Package className="w-7 h-7 text-bambu-green" />
@@ -1099,7 +1473,33 @@ function InventoryPage({ spoolmanMode = false, spoolmanModeReady = true }: { spo
           </h1>
           <p className="text-bambu-gray mt-1">{t('inventory.subtitle')}</p>
         </div>
-        <div className="flex items-center gap-2">
+        <div className="flex flex-wrap items-center gap-2">
+          {/* CSV import/export (#1576). Operates on Bambuddy's local inventory.
+              In Spoolman mode the buttons stay visible (feature parity) but are
+              disabled with a hint pointing at Spoolman's own CSV export, since
+              Spoolman owns the data store in that mode. */}
+          <Button
+            variant="secondary"
+            disabled={spoolmanMode}
+            onClick={() => setCsvImportOpen(true)}
+            title={spoolmanCsvHint}
+          >
+            <Upload className="w-4 h-4" />
+            {t('inventory.csv.importButton', 'Import CSV')}
+          </Button>
+          <Button
+            variant="secondary"
+            disabled={spoolmanMode || exportingCsv}
+            onClick={handleExportCsv}
+            title={spoolmanCsvHint}
+          >
+            {exportingCsv ? <Loader2 className="w-4 h-4 animate-spin" /> : <Download className="w-4 h-4" />}
+            {t('inventory.csv.exportButton', 'Export CSV')}
+          </Button>
+          <Button variant="secondary" onClick={() => setLocationsModalOpen(true)}>
+            <MapPin className="w-4 h-4" />
+            {t('locations.manage')}
+          </Button>
           <Button
             variant="secondary"
             disabled={filteredSpools.length === 0}
@@ -1140,15 +1540,15 @@ function InventoryPage({ spoolmanMode = false, spoolmanModeReady = true }: { spo
           <div className="bg-bambu-dark-secondary rounded-lg p-4">
             <div className="flex items-center justify-between gap-2 mb-1">
               <div className="flex items-center gap-2">
-                <TrendingDown className="w-4 h-4 text-blue-400" />
+                <TrendingDown className="w-4 h-4 text-blue-600 dark:text-blue-400" />
                 <span className="text-xs text-bambu-gray font-medium uppercase tracking-wide">{t('inventory.totalConsumed')}</span>
               </div>
               {stats.totalConsumed > 0 && resetableSpoolIds.length > 0 && (
                 <button
-                  onClick={() => setConfirmAction({ type: 'reset-all-usage' })}
-                  className="p-1 text-bambu-gray hover:text-red-400 rounded transition-colors"
-                  title={t('inventory.resetAllUsageTooltip')}
-                  aria-label={t('inventory.resetAllUsage')}
+                  onClick={() => setConfirmAction({ type: 'reset-all-consumed-counters' })}
+                  className="p-1 text-bambu-gray hover:text-red-600 dark:hover:text-red-400 rounded transition-colors"
+                  title={t('inventory.resetAllConsumedCountersTooltip')}
+                  aria-label={t('inventory.resetAllConsumedCounters')}
                 >
                   <Eraser className="w-3.5 h-3.5" />
                 </button>
@@ -1161,7 +1561,7 @@ function InventoryPage({ spoolmanMode = false, spoolmanModeReady = true }: { spo
           {/* By Material */}
           <div className="bg-bambu-dark-secondary rounded-lg p-4">
             <div className="flex items-center gap-2 mb-1">
-              <Layers className="w-4 h-4 text-green-400" />
+              <Layers className="w-4 h-4 text-green-600 dark:text-green-400" />
               <span className="text-xs text-bambu-gray font-medium uppercase tracking-wide">{t('inventory.byMaterial')}</span>
             </div>
             <div className="flex flex-wrap gap-1.5 mt-1">
@@ -1179,7 +1579,7 @@ function InventoryPage({ spoolmanMode = false, spoolmanModeReady = true }: { spo
           {/* In Printer */}
           <div className="bg-bambu-dark-secondary rounded-lg p-4">
             <div className="flex items-center gap-2 mb-1">
-              <Printer className="w-4 h-4 text-purple-400" />
+              <Printer className="w-4 h-4 text-purple-600 dark:text-purple-400" />
               <span className="text-xs text-bambu-gray font-medium uppercase tracking-wide">{t('inventory.inPrinter')}</span>
             </div>
             <div className="text-xl font-bold text-white">{inPrinterCount}</div>
@@ -1189,10 +1589,10 @@ function InventoryPage({ spoolmanMode = false, spoolmanModeReady = true }: { spo
           {/* Low Stock */}
           <div className="bg-bambu-dark-secondary rounded-lg p-4">
             <div className="flex items-center gap-2 mb-1">
-              <AlertTriangle className="w-4 h-4 text-yellow-400" />
+              <AlertTriangle className="w-4 h-4 text-yellow-600 dark:text-yellow-400" />
               <span className="text-xs text-bambu-gray font-medium uppercase tracking-wide">{t('inventory.lowStock')}</span>
             </div>
-            <div className={`text-xl font-bold ${stats.lowStock > 0 ? 'text-yellow-400' : 'text-white'}`}>{stats.lowStock}</div>
+            <div className={`text-xl font-bold ${stats.lowStock > 0 ? 'text-yellow-700 dark:text-yellow-400' : 'text-white'}`}>{stats.lowStock}</div>
             <div className="text-xs text-bambu-gray mt-1 flex items-center gap-2">
               {showThresholdInput ? (
                 <form
@@ -1406,7 +1806,7 @@ function InventoryPage({ spoolmanMode = false, spoolmanModeReady = true }: { spo
             onClick={() => { setUsageFilter('lowstock'); resetPage(); }}
             className={`flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium transition-colors ${
               usageFilter === 'lowstock'
-                ? 'bg-yellow-500/20 text-yellow-400'
+                ? 'bg-yellow-100 dark:bg-yellow-500/20 text-yellow-700 dark:text-yellow-400'
                 : 'text-bambu-gray hover:bg-bambu-dark-tertiary'
             }`}
           >
@@ -1431,7 +1831,7 @@ function InventoryPage({ spoolmanMode = false, spoolmanModeReady = true }: { spo
             onClick={() => { setStockFilter('stock'); resetPage(); }}
             className={`px-3 py-1.5 text-xs font-medium transition-colors ${
               stockFilter === 'stock'
-                ? 'bg-amber-500/20 text-amber-400'
+                ? 'bg-amber-100 dark:bg-amber-500/20 text-amber-700 dark:text-amber-400'
                 : 'text-bambu-gray hover:bg-bambu-dark-tertiary'
             }`}
           >
@@ -1526,10 +1926,10 @@ function InventoryPage({ spoolmanMode = false, spoolmanModeReady = true }: { spo
         {/* Storage location dropdown chip (#1400) — only render when at
             least one spool carries a storage location, otherwise it's noise
             (matches the category chip pattern). */}
-        {(uniqueStorageLocations.length > 0 || storageLocationFilter) && (
+        {(storageLocations.length > 0 || storageLocationFilter) && (
           <select
             value={storageLocationFilter}
-            onChange={(e) => { setStorageLocationFilter(e.target.value); resetPage(); }}
+            onChange={(e) => { setStorageLocationFilter(e.target.value); }}
             className={`px-3 py-1.5 rounded-lg border text-xs font-medium transition-colors cursor-pointer focus:outline-none ${
               storageLocationFilter
                 ? 'bg-bambu-green/20 text-bambu-green border-bambu-green/30'
@@ -1537,8 +1937,8 @@ function InventoryPage({ spoolmanMode = false, spoolmanModeReady = true }: { spo
             }`}
           >
             <option value="">{t('inventory.storageLocation')}</option>
-            {uniqueStorageLocations.map((loc) => (
-              <option key={loc} value={loc}>{loc}</option>
+            {storageLocations.map((loc) => (
+              <option key={loc.id} value={String(loc.id)}>{loc.name}</option>
             ))}
             {hasUnsetStorageLocation && (
               <option value="__none__">{t('inventory.storageLocationNone')}</option>
@@ -1568,6 +1968,54 @@ function InventoryPage({ spoolmanMode = false, spoolmanModeReady = true }: { spo
           </span>
         )}
       </div>
+
+      {/* Bulk action toolbar (#1795). Appears as soon as at least one
+          spool is selected; sticky so it stays visible while the user
+          scrolls a long list. */}
+      {selectedIds.size > 0 && viewMode !== 'forecast' && (
+        <div className="sticky top-2 z-10 mb-4 flex items-center gap-2 px-3 py-2 bg-bambu-green/10 border border-bambu-green/30 rounded-lg backdrop-blur-sm">
+          <span className="text-sm text-bambu-green font-medium">
+            {t('inventory.bulk.selectionCount', { count: selectedIds.size })}
+          </span>
+          <div className="ml-auto flex flex-wrap items-center gap-2">
+            <Button size="sm" variant="secondary" onClick={() => setBulkEditOpen(true)}>
+              <Edit2 className="w-3.5 h-3.5 mr-1.5" />
+              {t('inventory.bulk.edit')}
+            </Button>
+            <Button size="sm" variant="secondary" onClick={() => setLabelPickerSpoolIds([...selectedIds])}>
+              <Printer className="w-3.5 h-3.5 mr-1.5" />
+              {t('inventory.bulk.printLabels')}
+            </Button>
+            <Button size="sm" variant="secondary" onClick={() => setBulkConfirmAction('reset-consumed-counter')}>
+              <Eraser className="w-3.5 h-3.5 mr-1.5" />
+              {t('inventory.bulk.resetUsage')}
+            </Button>
+            {archiveFilter === 'archived' ? (
+              <Button size="sm" variant="secondary" onClick={() => setBulkConfirmAction('restore')}>
+                <RotateCcw className="w-3.5 h-3.5 mr-1.5" />
+                {t('inventory.bulk.restore')}
+              </Button>
+            ) : (
+              <Button size="sm" variant="secondary" onClick={() => setBulkConfirmAction('archive')}>
+                <Archive className="w-3.5 h-3.5 mr-1.5" />
+                {t('inventory.bulk.archive')}
+              </Button>
+            )}
+            <Button size="sm" variant="danger" onClick={() => setBulkConfirmAction('delete')}>
+              <Trash2 className="w-3.5 h-3.5 mr-1.5" />
+              {t('inventory.bulk.delete')}
+            </Button>
+            <button
+              className="p-1.5 text-bambu-gray hover:text-white rounded transition-colors"
+              onClick={clearSelection}
+              title={t('inventory.bulk.clearSelection')}
+              aria-label={t('inventory.bulk.clearSelection')}
+            >
+              <X className="w-4 h-4" />
+            </button>
+          </div>
+        </div>
+      )}
 
       {/* Content */}
       {isLoading ? (
@@ -1645,6 +2093,10 @@ function InventoryPage({ spoolmanMode = false, spoolmanModeReady = true }: { spo
                                 onPrintLabel={() => setLabelPickerSpoolIds([spool.id])}
                                 onCopy={() => setFormModal({ spool: spool, mode: 'copy' })}
                                 t={t}
+                                colorizeLocationSensors={colorizeLocationSensors}
+                                locationSensorAboveColor={locationSensorAboveColor}
+                                locationSensorBelowColor={locationSensorBelowColor}
+                                locationSensorOptimalColor={locationSensorOptimalColor}
                               />
                             );
                           })}
@@ -1666,6 +2118,10 @@ function InventoryPage({ spoolmanMode = false, spoolmanModeReady = true }: { spo
                     onPrintLabel={() => setLabelPickerSpoolIds([spool.id])}
                     onCopy={() => setFormModal({ spool: spool, mode: 'copy' })}
                     t={t}
+                    colorizeLocationSensors={colorizeLocationSensors}
+                    locationSensorAboveColor={locationSensorAboveColor}
+                    locationSensorBelowColor={locationSensorBelowColor}
+                    locationSensorOptimalColor={locationSensorOptimalColor}
                   />
                 );
               })}
@@ -1696,6 +2152,34 @@ function InventoryPage({ spoolmanMode = false, spoolmanModeReady = true }: { spo
               <table className="w-full">
                 <thead>
                   <tr className="border-b border-bambu-dark-tertiary bg-bambu-dark-tertiary/30">
+                    <th className="w-10 px-3 py-3">
+                      <input
+                        type="checkbox"
+                        className="h-4 w-4 cursor-pointer"
+                        aria-label={t('inventory.bulk.selectAllVisible')}
+                        checked={pagedItems.length > 0 && pagedItems.every((item) => {
+                          const ids = item.type === 'group' ? item.spools.map((s) => s.id) : [item.spool.id];
+                          return ids.every((id) => selectedIds.has(id));
+                        })}
+                        onChange={(e) => {
+                          if (e.target.checked) {
+                            const next = new Set(selectedIds);
+                            for (const item of pagedItems) {
+                              const ids = item.type === 'group' ? item.spools.map((s) => s.id) : [item.spool.id];
+                              for (const id of ids) next.add(id);
+                            }
+                            setSelectedIds(next);
+                          } else {
+                            const next = new Set(selectedIds);
+                            for (const item of pagedItems) {
+                              const ids = item.type === 'group' ? item.spools.map((s) => s.id) : [item.spool.id];
+                              for (const id of ids) next.delete(id);
+                            }
+                            setSelectedIds(next);
+                          }
+                        }}
+                      />
+                    </th>
                     {visibleColumns.map((colId) => {
                       const sortable = !!columnSortValues[colId];
                       const isActive = sortState?.column === colId;
@@ -1742,19 +2226,36 @@ function InventoryPage({ spoolmanMode = false, spoolmanModeReady = true }: { spo
                           pct={pct}
                           isExpanded={isExpanded}
                           onToggle={() => toggleGroupExpand(key)}
+                          selectedIds={selectedIds}
+                          onToggleSelected={toggleSelected}
+                          onToggleGroupSelected={(ids, select) => {
+                            setSelectedIds((prev) => {
+                              const next = new Set(prev);
+                              for (const id of ids) {
+                                if (select) next.add(id);
+                                else next.delete(id);
+                              }
+                              return next;
+                            });
+                          }}
                           onEdit={(s) => setFormModal({ spool: s, mode: 'edit' })}
                           onCopy={(s) => setFormModal({ spool: s, mode: 'copy' })}
                           onArchive={(id) => setConfirmAction({ type: 'archive', spoolId: id })}
                           onDelete={(id) => setConfirmAction({ type: 'delete', spoolId: id })}
                           onPrintLabel={(id) => setLabelPickerSpoolIds([id])}
-                          onResetUsage={(id) => setConfirmAction({ type: 'reset-usage', spoolId: id })}
+                          onResetConsumedCounter={(id) => setConfirmAction({ type: 'reset-consumed-counter', spoolId: id })}
                           visibleColumns={visibleColumns}
                           assignmentMap={assignmentMap}
                           catalogMap={catalogMap}
+                          locationReadingsMap={locationReadingsMap}
                           currencySymbol={currencySymbol}
                           dateFormat={dateFormat}
                           t={t}
                           onSyncWeight={handleSyncWeight}
+                          colorizeLocationSensors={colorizeLocationSensors}
+                          locationSensorAboveColor={locationSensorAboveColor}
+                          locationSensorBelowColor={locationSensorBelowColor}
+                          locationSensorOptimalColor={locationSensorOptimalColor}
                         />
                       );
                     }
@@ -1767,20 +2268,27 @@ function InventoryPage({ spoolmanMode = false, spoolmanModeReady = true }: { spo
                         spool={spool}
                         remaining={remaining}
                         pct={pct}
+                        isSelected={selectedIds.has(spool.id)}
+                        onToggleSelected={() => toggleSelected(spool.id)}
                         onEdit={() => setFormModal({ spool, mode: 'edit' })}
                         onCopy={() => setFormModal({ spool: spool, mode: 'copy' })}
                         onRestore={() => restoreMutation.mutate(spool.id)}
                         onArchive={() => setConfirmAction({ type: 'archive', spoolId: spool.id })}
                         onDelete={() => setConfirmAction({ type: 'delete', spoolId: spool.id })}
                         onPrintLabel={() => setLabelPickerSpoolIds([spool.id])}
-                        onResetUsage={() => setConfirmAction({ type: 'reset-usage', spoolId: spool.id })}
+                        onResetConsumedCounter={() => setConfirmAction({ type: 'reset-consumed-counter', spoolId: spool.id })}
                         visibleColumns={visibleColumns}
                         assignmentMap={assignmentMap}
                         catalogMap={catalogMap}
+                        locationReadingsMap={locationReadingsMap}
                         currencySymbol={currencySymbol}
                         dateFormat={dateFormat}
                         t={t}
                         onSyncWeight={handleSyncWeight}
+                        colorizeLocationSensors={colorizeLocationSensors}
+                        locationSensorAboveColor={locationSensorAboveColor}
+                        locationSensorBelowColor={locationSensorBelowColor}
+                        locationSensorOptimalColor={locationSensorOptimalColor}
                       />
                     );
                   })}
@@ -1874,25 +2382,25 @@ function InventoryPage({ spoolmanMode = false, spoolmanModeReady = true }: { spo
         />
       )}
 
-      {/* Confirm Modal (delete / archive / reset-usage / reset-all-usage) */}
+      {/* Confirm Modal (delete / archive / reset-consumed-counter / reset-all-consumed-counters) */}
       {confirmAction && (
         <ConfirmModal
           title={
             confirmAction.type === 'delete' ? t('common.delete') :
             confirmAction.type === 'archive' ? t('inventory.archive') :
-            confirmAction.type === 'reset-usage' ? t('inventory.resetUsage') :
-            t('inventory.resetAllUsage')
+            confirmAction.type === 'reset-consumed-counter' ? t('inventory.resetConsumedCounter') :
+            t('inventory.resetAllConsumedCounters')
           }
           message={
             confirmAction.type === 'delete' ? t('inventory.deleteConfirm') :
             confirmAction.type === 'archive' ? t('inventory.archiveConfirm') :
-            confirmAction.type === 'reset-usage' ? t('inventory.resetUsageConfirm') :
-            t('inventory.resetAllUsageConfirm', { count: resetableSpoolIds.length })
+            confirmAction.type === 'reset-consumed-counter' ? t('inventory.resetConsumedCounterConfirm') :
+            t('inventory.resetAllConsumedCountersConfirm', { count: resetableSpoolIds.length })
           }
           confirmText={
             confirmAction.type === 'delete' ? t('common.delete') :
             confirmAction.type === 'archive' ? t('inventory.archive') :
-            t('inventory.resetUsage')
+            t('inventory.resetConsumedCounter')
           }
           variant={confirmAction.type === 'archive' ? 'warning' : 'danger'}
           onConfirm={() => {
@@ -1900,10 +2408,10 @@ function InventoryPage({ spoolmanMode = false, spoolmanModeReady = true }: { spo
               deleteMutation.mutate(confirmAction.spoolId);
             } else if (confirmAction.type === 'archive') {
               archiveMutation.mutate(confirmAction.spoolId);
-            } else if (confirmAction.type === 'reset-usage') {
-              resetUsageMutation.mutate(confirmAction.spoolId);
+            } else if (confirmAction.type === 'reset-consumed-counter') {
+              resetConsumedCounterMutation.mutate(confirmAction.spoolId);
             } else {
-              bulkResetUsageMutation.mutate(resetableSpoolIds);
+              bulkResetConsumedCounterMutation.mutate(resetableSpoolIds);
             }
             setConfirmAction(null);
           }}
@@ -1926,6 +2434,76 @@ function InventoryPage({ spoolmanMode = false, spoolmanModeReady = true }: { spo
         availableSpools={filteredSpools}
         initialSelectedIds={labelPickerSpoolIds ?? []}
         spoolmanMode={spoolmanMode}
+      />
+
+      <BulkEditSpoolsModal
+        isOpen={bulkEditOpen}
+        selectedCount={selectedIds.size}
+        isPending={bulkUpdateMutation.isPending}
+        availableLocations={storageLocations.map((l) => ({ id: l.id, name: l.name }))}
+        availableMaterials={dedupeAndSort((spools ?? []).map((s) => s.material))}
+        availableSubtypes={dedupeAndSort((spools ?? []).map((s) => s.subtype))}
+        availableBrands={dedupeAndSort((spools ?? []).map((s) => s.brand))}
+        availableCategories={dedupeAndSort((spools ?? []).map((s) => s.category))}
+        availableSlicerFilaments={dedupeAndSort((spools ?? []).map((s) => s.slicer_filament))}
+        availableSlicerFilamentNames={dedupeAndSort((spools ?? []).map((s) => s.slicer_filament_name))}
+        onClose={() => setBulkEditOpen(false)}
+        onApply={(patch) => bulkUpdateMutation.mutate({ ids: [...selectedIds], update: patch })}
+      />
+
+      {bulkConfirmAction && (
+        <ConfirmModal
+          title={
+            bulkConfirmAction === 'delete' ? t('inventory.bulk.deleteTitle') :
+            bulkConfirmAction === 'archive' ? t('inventory.bulk.archiveTitle') :
+            bulkConfirmAction === 'restore' ? t('inventory.bulk.restoreTitle') :
+            t('inventory.bulk.resetUsageTitle')
+          }
+          message={
+            bulkConfirmAction === 'delete' ? t('inventory.bulk.deleteMessage', { count: selectedIds.size }) :
+            bulkConfirmAction === 'archive' ? t('inventory.bulk.archiveMessage', { count: selectedIds.size }) :
+            bulkConfirmAction === 'restore' ? t('inventory.bulk.restoreMessage', { count: selectedIds.size }) :
+            t('inventory.bulk.resetUsageMessage', { count: selectedIds.size })
+          }
+          confirmText={
+            bulkConfirmAction === 'delete' ? t('common.delete') :
+            bulkConfirmAction === 'archive' ? t('inventory.archive') :
+            bulkConfirmAction === 'restore' ? t('inventory.restore') :
+            t('inventory.resetConsumedCounter')
+          }
+          variant={bulkConfirmAction === 'delete' ? 'danger' : 'warning'}
+          isLoading={
+            bulkDeleteMutation.isPending ||
+            bulkArchiveMutation.isPending ||
+            bulkRestoreMutation.isPending ||
+            bulkResetConsumedCounterMutation.isPending
+          }
+          onConfirm={() => {
+            const ids = [...selectedIds];
+            if (bulkConfirmAction === 'delete') bulkDeleteMutation.mutate(ids);
+            else if (bulkConfirmAction === 'archive') bulkArchiveMutation.mutate(ids);
+            else if (bulkConfirmAction === 'restore') bulkRestoreMutation.mutate(ids);
+            else bulkResetConsumedCounterMutation.mutate(ids);
+          }}
+          onCancel={() => setBulkConfirmAction(null)}
+        />
+      )}
+
+      {csvImportOpen && (
+        <SpoolCsvImportModal
+          onClose={() => setCsvImportOpen(false)}
+          onImported={(created) => {
+            setCsvImportOpen(false);
+            queryClient.invalidateQueries({ queryKey: spoolsQueryKey });
+            showToast(t('inventory.csv.importSuccess', '{{count}} spools imported', { count: created }), 'success');
+          }}
+        />
+      )}
+
+      <LocationsModal
+        open={locationsModalOpen}
+        onClose={() => setLocationsModalOpen(false)}
+        onPickLocation={(id) => setStorageLocationFilter(String(id))}
       />
     </div>
   );
@@ -2011,6 +2589,7 @@ function PaginationBar({
 /* Spool card for cards view */
 function SpoolCard({
   spool, remaining, pct, onClick, onPrintLabel, onCopy, t,
+  colorizeLocationSensors, locationSensorAboveColor, locationSensorBelowColor, locationSensorOptimalColor,
 }: {
   spool: InventorySpool;
   remaining: number;
@@ -2019,6 +2598,10 @@ function SpoolCard({
   onPrintLabel?: () => void;
   onCopy?: () => void;
   t: (key: string, opts?: Record<string, unknown>) => string;
+  colorizeLocationSensors: boolean;
+  locationSensorAboveColor: LocationSensorAlertColor;
+  locationSensorBelowColor: LocationSensorAlertColor;
+  locationSensorOptimalColor: LocationSensorAlertColor;
 }) {
   const bannerStyle = buildFilamentBackground({
     rgba: spool.rgba,
@@ -2100,9 +2683,20 @@ function SpoolCard({
             </span>
           </div>
         </div>
+        {spool.location_id && (
+          <SpoolLocationFooter
+            locationId={spool.location_id}
+            locationName={spool.storage_location ?? null}
+            isLast={!spool.note}
+            colorize={colorizeLocationSensors}
+            aboveColor={locationSensorAboveColor}
+            belowColor={locationSensorBelowColor}
+            optimalColor={locationSensorOptimalColor}
+          />
+        )}
         {spool.note && (
           <div
-            className="text-xs text-bambu-gray/60 pt-2 border-t border-bambu-dark-tertiary truncate"
+            className="text-xs text-bambu-gray/60 pt-3 border-t border-bambu-dark-tertiary truncate"
             title={spool.note}
           >
             {spool.note}
@@ -2113,39 +2707,179 @@ function SpoolCard({
   );
 }
 
+const LOCATION_SENSOR_CATEGORY_ORDER: Record<string, number> = {
+  temperature: 0,
+  humidity: 1,
+  battery: 2,
+};
+
+function locationSensorIconGapClass(deviceClass: string | null): string {
+  if (deviceClass === 'humidity') return 'mr-[2px]';
+  if (deviceClass === 'battery') return 'mr-[3px]';
+  return '';
+}
+
+// Two decimal places, unlike the printer row's raw value: keeps
+// temperature/humidity/battery cells at a consistent width in the table and
+// card grid (see describeHASensorReading's doc comment).
+function describeLocationSensor(
+  reading: LocationHASensorReading,
+  t: (key: string, opts?: Record<string, unknown>) => string
+): string {
+  return describeHASensorReading(reading, t, { decimals: 2 });
+}
+
+function locationSensorCellColor(
+  reading: LocationHASensorReading,
+  colorize: boolean,
+  aboveColor: LocationSensorAlertColor,
+  belowColor: LocationSensorAlertColor,
+  optimalColor: LocationSensorAlertColor
+): string {
+  if (!colorize) return 'text-bambu-gray';
+  const status = locationSensorReadingAlertStatus(reading);
+  return locationSensorValueColorClass(status, aboveColor, belowColor, optimalColor) || 'text-bambu-gray';
+}
+
+function SpoolLocationFooter({
+  locationId, locationName, isLast, colorize, aboveColor, belowColor, optimalColor,
+}: {
+  locationId: number;
+  locationName: string | null;
+  isLast: boolean;
+  colorize: boolean;
+  aboveColor: LocationSensorAlertColor;
+  belowColor: LocationSensorAlertColor;
+  optimalColor: LocationSensorAlertColor;
+}) {
+  const { t } = useTranslation();
+
+  const { data: settings } = useQuery({ queryKey: ['settings'], queryFn: api.getSettings });
+  const pollIntervalMs = (settings?.location_sensor_poll_interval || 120) * 1000;
+
+  // Same query key as the list fetch in InventoryPage's body, so this is a
+  // cache read (no extra request) whenever that has already run — which it
+  // has, since card view and this footer only render after spools/locations
+  // are loaded.
+  const { data: sensorsList } = useQuery({
+    queryKey: ['locationHaSensors'],
+    queryFn: () => api.getLocationHASensors(),
+  });
+  const hasSensor = (sensorsList ?? []).some((s) => s.location_id === locationId);
+
+  // Same query key as the table-view columns' fetch in InventoryPage's body
+  // (unfiltered, show_on_card=false) — this is a cache read whenever that
+  // has already run, and the two views never need two different requests
+  // for one location. Filtering to card-visible sensors happens here
+  // instead of on the server.
+  const { data: allReadings } = useQuery({
+    queryKey: ['locationHaSensorReadings', locationId],
+    queryFn: () => api.getLocationHASensorReadings(locationId, false),
+    refetchInterval: pollIntervalMs,
+    enabled: hasSensor,
+  });
+  const readings = allReadings?.filter((r) => r.show_on_card);
+
+  if (!readings?.length) return null;
+
+  const batteryReading = readings.find((r) => r.device_class === 'battery');
+  const otherReadings = readings
+    .filter((r) => r.device_class !== 'battery')
+    .sort(
+      (a, b) =>
+        (LOCATION_SENSOR_CATEGORY_ORDER[a.device_class ?? ''] ?? 99) -
+        (LOCATION_SENSOR_CATEGORY_ORDER[b.device_class ?? ''] ?? 99)
+    );
+
+  return (
+    <div
+      className={`flex items-center gap-2 pt-3 border-t border-bambu-dark-tertiary text-xs text-bambu-gray ${isLast ? '-mb-1' : ''}`}
+    >
+      {locationName && <span className="truncate">{locationName}</span>}
+      <span className="text-bambu-gray/40">|</span>
+      <div className="flex items-center gap-3">
+        {otherReadings.map((reading, index) => {
+          const Icon = iconForHASensor(reading);
+          const firstIconOffsetClass = index === 0 ? 'ml-[-3.6px]' : '';
+          return (
+            <span key={reading.id} title={reading.name} className="flex items-center gap-[3px]">
+              <Icon className={`w-3 h-3 ${locationSensorIconGapClass(reading.device_class)} ${firstIconOffsetClass}`} />
+              <span className={locationSensorCellColor(reading, colorize, aboveColor, belowColor, optimalColor)}>
+                {describeLocationSensor(reading, t)}
+              </span>
+            </span>
+          );
+        })}
+      </div>
+      {batteryReading &&
+        (() => {
+          const Icon = iconForHASensor(batteryReading);
+          return (
+            <span key={batteryReading.id} title={batteryReading.name} className="flex items-center gap-[3px] ml-auto">
+              <Icon className={`w-3 h-3 ${locationSensorIconGapClass(batteryReading.device_class)}`} />
+              <span className={locationSensorCellColor(batteryReading, colorize, aboveColor, belowColor, optimalColor)}>
+                {describeLocationSensor(batteryReading, t)}
+              </span>
+            </span>
+          );
+        })()}
+    </div>
+  );
+}
+
 /* Single spool row for table view */
 function SpoolTableRow({
-  spool, remaining, pct, onEdit, onCopy, onRestore, onArchive, onDelete, onPrintLabel, onResetUsage,
-  visibleColumns, assignmentMap, catalogMap, currencySymbol, dateFormat, t, onSyncWeight,
+  spool, remaining, pct, isSelected, onToggleSelected,
+  onEdit, onCopy, onRestore, onArchive, onDelete, onPrintLabel, onResetConsumedCounter,
+  visibleColumns, assignmentMap, catalogMap, locationReadingsMap, currencySymbol, dateFormat, t, onSyncWeight,
+  colorizeLocationSensors, locationSensorAboveColor, locationSensorBelowColor, locationSensorOptimalColor,
 }: {
   spool: InventorySpool;
   remaining: number;
   pct: number;
+  isSelected?: boolean;
+  onToggleSelected?: () => void;
   onEdit: () => void;
   onCopy?: () => void;
   onRestore: () => void;
   onArchive: () => void;
   onDelete: () => void;
   onPrintLabel?: () => void;
-  onResetUsage?: () => void;
+  onResetConsumedCounter?: () => void;
   visibleColumns: string[];
   assignmentMap: Record<number, LocationDisplay>;
   catalogMap: Record<number, SpoolCatalogEntry>;
+  locationReadingsMap: Record<number, LocationHASensorReading[]>;
   currencySymbol: string;
   dateFormat: DateFormat;
   t: TFn;
   onSyncWeight?: (spool: InventorySpool) => void;
+  colorizeLocationSensors: boolean;
+  locationSensorAboveColor: LocationSensorAlertColor;
+  locationSensorBelowColor: LocationSensorAlertColor;
+  locationSensorOptimalColor: LocationSensorAlertColor;
 }) {
   return (
     <tr
       className={`border-b border-bambu-dark-tertiary/50 hover:bg-bambu-dark-tertiary/30 transition-colors cursor-pointer ${
         spool.archived_at ? 'opacity-50' : ''
-      }`}
+      } ${isSelected ? 'bg-bambu-green/10' : ''}`}
       onClick={onEdit}
     >
+      <td className="w-10 px-3 py-3" onClick={(e) => e.stopPropagation()}>
+        {onToggleSelected && (
+          <input
+            type="checkbox"
+            className="h-4 w-4 cursor-pointer"
+            aria-label={t('inventory.bulk.selectRow')}
+            checked={!!isSelected}
+            onChange={onToggleSelected}
+          />
+        )}
+      </td>
       {visibleColumns.map((colId) => (
         <td key={colId} className="py-3 px-4">
-          {columnCells[colId]?.({ spool, remaining, pct, assignmentMap, catalogMap, currencySymbol, dateFormat, t, onSyncWeight })}
+          {columnCells[colId]?.({ spool, remaining, pct, assignmentMap, catalogMap, locationReadingsMap, currencySymbol, dateFormat, t, onSyncWeight, colorizeLocationSensors, locationSensorAboveColor, locationSensorBelowColor, locationSensorOptimalColor })}
         </td>
       ))}
       <td className="py-3 px-4">
@@ -2163,12 +2897,12 @@ function SpoolTableRow({
               <Printer className="w-4 h-4" />
             </button>
           )}
-          {onResetUsage && spool.weight_used > 0 && (
+          {onResetConsumedCounter && spool.weight_used > 0 && (
             // Eraser also shows on archived spools (#1390 follow-up):
             // archived consumed weight now counts in "Total Consumed", so
             // the user needs a way to zero an archived spool's tracking
             // counter individually without having to un-archive it first.
-            <button onClick={onResetUsage} className="p-1.5 text-bambu-gray hover:text-orange-400 rounded transition-colors" title={t('inventory.resetUsageTooltip')}>
+            <button onClick={onResetConsumedCounter} className="p-1.5 text-bambu-gray hover:text-orange-600 dark:hover:text-orange-400 rounded transition-colors" title={t('inventory.resetConsumedCounterTooltip')}>
               <Eraser className="w-4 h-4" />
             </button>
           )}
@@ -2177,11 +2911,11 @@ function SpoolTableRow({
               <RotateCcw className="w-4 h-4" />
             </button>
           ) : (
-            <button onClick={onArchive} className="p-1.5 text-bambu-gray hover:text-yellow-400 rounded transition-colors" title={t('inventory.archive')}>
+            <button onClick={onArchive} className="p-1.5 text-bambu-gray hover:text-yellow-600 dark:hover:text-yellow-400 rounded transition-colors" title={t('inventory.archive')}>
               <Archive className="w-4 h-4" />
             </button>
           )}
-          <button onClick={onDelete} className="p-1.5 text-bambu-gray hover:text-red-400 rounded transition-colors" title={t('common.delete')}>
+          <button onClick={onDelete} className="p-1.5 text-bambu-gray hover:text-red-600 dark:hover:text-red-400 rounded transition-colors" title={t('common.delete')}>
             <Trash2 className="w-4 h-4" />
           </button>
         </div>
@@ -2193,8 +2927,10 @@ function SpoolTableRow({
 /* Grouped spool rows for table view */
 function SpoolTableGroup({
   spools, headerSpool, remaining, pct, isExpanded, onToggle,
-  onEdit, onCopy, onArchive, onDelete, onPrintLabel, onResetUsage,
-  visibleColumns, assignmentMap, catalogMap, currencySymbol, dateFormat, t, onSyncWeight,
+  onEdit, onCopy, onArchive, onDelete, onPrintLabel, onResetConsumedCounter,
+  visibleColumns, assignmentMap, catalogMap, locationReadingsMap, currencySymbol, dateFormat, t, onSyncWeight,
+  colorizeLocationSensors, locationSensorAboveColor, locationSensorBelowColor, locationSensorOptimalColor,
+  selectedIds, onToggleSelected, onToggleGroupSelected,
 }: {
   spools: InventorySpool[];
   // Aggregate of all members (summed quantities, shared identity) — rendered
@@ -2209,15 +2945,24 @@ function SpoolTableGroup({
   onArchive: (id: number) => void;
   onDelete: (id: number) => void;
   onPrintLabel?: (spoolId: number) => void;
-  onResetUsage?: (id: number) => void;
+  onResetConsumedCounter?: (id: number) => void;
   visibleColumns: string[];
   assignmentMap: Record<number, LocationDisplay>;
   catalogMap: Record<number, SpoolCatalogEntry>;
+  locationReadingsMap: Record<number, LocationHASensorReading[]>;
   currencySymbol: string;
   dateFormat: DateFormat;
   t: TFn;
   onSyncWeight?: (spool: InventorySpool) => void;
+  colorizeLocationSensors: boolean;
+  locationSensorAboveColor: LocationSensorAlertColor;
+  locationSensorBelowColor: LocationSensorAlertColor;
+  locationSensorOptimalColor: LocationSensorAlertColor;
+  selectedIds?: Set<number>;
+  onToggleSelected?: (id: number) => void;
+  onToggleGroupSelected?: (ids: number[], select: boolean) => void;
 }) {
+  const allMembersSelected = !!selectedIds && spools.every((s) => selectedIds.has(s.id));
   return (
     <>
       {/* Group header row */}
@@ -2225,19 +2970,30 @@ function SpoolTableGroup({
         className="border-b border-bambu-dark-tertiary/50 hover:bg-bambu-dark-tertiary/30 transition-colors cursor-pointer bg-bambu-green/5"
         onClick={onToggle}
       >
+        <td className="w-10 px-3 py-3" onClick={(e) => e.stopPropagation()}>
+          {onToggleGroupSelected && (
+            <input
+              type="checkbox"
+              className="h-4 w-4 cursor-pointer"
+              aria-label={t('inventory.bulk.selectGroup')}
+              checked={allMembersSelected}
+              onChange={(e) => onToggleGroupSelected(spools.map((s) => s.id), e.target.checked)}
+            />
+          )}
+        </td>
         {visibleColumns.map((colId, idx) => (
           <td key={colId} className="py-3 px-4">
             {idx === 0 ? (
               <div className="flex items-center gap-2">
                 <ChevronDown className={`w-4 h-4 text-bambu-gray transition-transform ${isExpanded ? '' : '-rotate-90'}`} />
-                {columnCells[colId]?.({ spool: headerSpool, remaining, pct, assignmentMap, catalogMap, currencySymbol, dateFormat, t, onSyncWeight })}
+                {columnCells[colId]?.({ spool: headerSpool, remaining, pct, assignmentMap, catalogMap, locationReadingsMap, currencySymbol, dateFormat, t, onSyncWeight, colorizeLocationSensors, locationSensorAboveColor, locationSensorBelowColor, locationSensorOptimalColor })}
               </div>
             ) : colId === 'id' ? (
               <span className="text-xs font-medium bg-bambu-green/20 text-bambu-green px-2 py-0.5 rounded-full">
                 {t('inventory.groupedSpools', { count: spools.length })}
               </span>
             ) : (
-              columnCells[colId]?.({ spool: headerSpool, remaining, pct, assignmentMap, catalogMap, currencySymbol, dateFormat, t, onSyncWeight })
+              columnCells[colId]?.({ spool: headerSpool, remaining, pct, assignmentMap, catalogMap, locationReadingsMap, currencySymbol, dateFormat, t, onSyncWeight, colorizeLocationSensors, locationSensorAboveColor, locationSensorBelowColor, locationSensorOptimalColor })
             )}
           </td>
         ))}
@@ -2257,20 +3013,27 @@ function SpoolTableGroup({
             spool={spool}
             remaining={r}
             pct={p}
+            isSelected={selectedIds?.has(spool.id)}
+            onToggleSelected={onToggleSelected ? () => onToggleSelected(spool.id) : undefined}
             onEdit={() => onEdit(spool)}
             onCopy={onCopy ? () => onCopy(spool) : undefined}
             onRestore={() => {}}
             onArchive={() => onArchive(spool.id)}
             onDelete={() => onDelete(spool.id)}
             onPrintLabel={onPrintLabel ? () => onPrintLabel(spool.id) : undefined}
-            onResetUsage={onResetUsage ? () => onResetUsage(spool.id) : undefined}
+            onResetConsumedCounter={onResetConsumedCounter ? () => onResetConsumedCounter(spool.id) : undefined}
             visibleColumns={visibleColumns}
             assignmentMap={assignmentMap}
             catalogMap={catalogMap}
+            locationReadingsMap={locationReadingsMap}
             currencySymbol={currencySymbol}
             dateFormat={dateFormat}
             t={t}
             onSyncWeight={onSyncWeight}
+            colorizeLocationSensors={colorizeLocationSensors}
+            locationSensorAboveColor={locationSensorAboveColor}
+            locationSensorBelowColor={locationSensorBelowColor}
+            locationSensorOptimalColor={locationSensorOptimalColor}
           />
         );
       })}
