@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -542,6 +543,59 @@ async def build_slot_materials(db: AsyncSession, printer_id: int) -> list[SlotMa
             _identity_from_internal(spool),
         )
     return materials
+
+
+async def remaining_filament_after_print(db: AsyncSession, item: PrintQueueItem) -> float | None:
+    """Estimated grams left on the used feeds, for ranking eligible printers.
+
+    The caller supplies a resolved candidate (source, printer and mapping).
+    Unknown weights are not empty spools: return None and let known sufficient
+    candidates rank first. This is a preference, not a replacement for the
+    deficit check. With Filament Backup enabled, count each used material pool
+    once, respecting the existing material identity and extruder boundaries.
+    """
+    if item.printer_id is None:
+        return None
+    source = _resolve_source_3mf(item)
+    mapping = _parse_ams_mapping(item.ams_mapping)
+    if source is None or not source.exists() or not mapping:
+        return None
+    requirements = extract_filament_requirements(source, item.plate_id)
+    if not requirements:
+        return None
+
+    materials = await build_slot_materials(db, item.printer_id)
+    by_tray = {slot.global_tray_id: slot for slot in materials}
+    backup_on, _, _ = await _get_printer_backup_context(item.printer_id)
+    required_by_feed: dict[tuple, float] = defaultdict(float)
+    available_by_feed: dict[tuple, float] = {}
+    for req in requirements:
+        grams = req.get("used_grams")
+        slot_id = req.get("slot_id")
+        if not isinstance(grams, (int, float)) or not math.isfinite(grams) or grams < 0:
+            return None
+        if grams == 0:
+            continue
+        if not isinstance(slot_id, int) or not 1 <= slot_id <= len(mapping):
+            return None
+        slot = by_tray.get(mapping[slot_id - 1])
+        if slot is None:
+            return None
+        key = (slot.material_key, slot.extruder) if backup_on else (slot.global_tray_id,)
+        required_by_feed[key] += grams
+        if key not in available_by_feed:
+            pool = [s for s in materials if (s.material_key, s.extruder) == key] if backup_on else [slot]
+            if any(not math.isfinite(s.remaining_grams) or s.remaining_grams < 0 for s in pool):
+                return None
+            available_by_feed[key] = sum(s.remaining_grams for s in pool)
+    if not required_by_feed:
+        return None
+    leftovers = [available_by_feed[key] - required for key, required in required_by_feed.items()]
+    # A user override may permit a shortage, but it must not make a too-small
+    # spool outrank one that can actually finish the job.
+    if any(grams < 0 for grams in leftovers):
+        return None
+    return sum(leftovers)
 
 
 async def compute_deficit_for_queue_item(

@@ -399,7 +399,7 @@ async def test_cross_model_gate_is_applied_per_candidate(queue_db):
 
     await _run_check_queue(queue_db, scheduler, finder)
 
-    assert [c.args[1] for c in finder.await_args_list] == ["H2C"], "the mismatched variant never reaches the matcher"
+    assert {c.args[1] for c in finder.await_args_list} == {"H2C"}, "the mismatched variant never reaches the matcher"
     item = await _get_item(queue_db, item_id)
     assert item.printer_id == 2
     assert item.target_model == "H2C"

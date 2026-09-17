@@ -41,7 +41,7 @@ from backend.app.services.bambu_ftp import (
     with_ftp_retry,
 )
 from backend.app.services.bambu_mqtt import _RACK_NOZZLE_IDS, HMS_MQTT_VERIFY_FAILED, resolve_rack_plan_mapping
-from backend.app.services.filament_deficit import compute_deficit_for_queue_item
+from backend.app.services.filament_deficit import compute_deficit_for_queue_item, remaining_filament_after_print
 from backend.app.services.finance_budget import (
     create_budget_reservation,
     release_budget_reservation,
@@ -2749,10 +2749,13 @@ class PrintScheduler:
         require_plate_clear: bool,
         wakeable_ids: set[int],
     ) -> tuple[int | None, str | None, str | None, bool]:
-        """Try each eligible printer with its own mapping and inventory."""
+        """Prefer the least leftover filament among eligible candidate printers."""
         excluded = set(exclude_ids)
         reasons = []
         had_deficit = False
+        best: tuple[int, str | None] | None = None
+        best_rank: tuple[int, bool, float] | None = None
+        preferences = [o for o in (filament_overrides or []) if not o.get("force_color_match")]
         probe = SimpleNamespace(**{column.key: getattr(item, column.key) for column in item.__table__.columns})
         probe.archive = item.archive
         probe.library_file = item.library_file
@@ -2769,6 +2772,15 @@ class PrintScheduler:
                 wakeable_ids=wakeable_ids,
             )
             if printer_id is None:
+                if best is not None:
+                    if best_rank is not None and not best_rank[1]:
+                        logger.info(
+                            "Queue item %s: selected printer %s with %.1f g estimated filament left after print",
+                            item.id,
+                            best[0],
+                            best_rank[2],
+                        )
+                    return best[0], None, best[1], had_deficit
                 if reason:
                     reasons.append(reason)
                 return None, " | ".join(reasons), None, had_deficit
@@ -2801,7 +2813,18 @@ class PrintScheduler:
                     )
                     reasons.append(f"Printer {printer_id}: insufficient filament ({detail})")
                     continue
-                return printer_id, None, probe.ams_mapping, had_deficit
+                try:
+                    leftover = await remaining_filament_after_print(db, probe)
+                except Exception:
+                    logger.warning("Queue item %s: leftover estimate unavailable on printer %s", item.id, printer_id)
+                    leftover = None
+                # Retain explicit colour preference quality ahead of the new
+                # waste preference. Equal scores retain the matcher's order.
+                color_matches = self._count_override_color_matches(printer_id, preferences) if preferences else 0
+                rank = (-color_matches, leftover is None, leftover if leftover is not None else 0.0)
+                if best_rank is None or rank < best_rank:
+                    best = (printer_id, probe.ams_mapping)
+                    best_rank = rank
             except Exception:
                 logger.exception("Queue item %s: filament probe failed on printer %s", item.id, printer_id)
                 reasons.append(f"Printer {printer_id}: filament check unavailable; retrying automatically")

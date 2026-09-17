@@ -12,6 +12,21 @@ printer, or a smaller job that fits on the remaining spool, can still run.
 If none qualifies, the job remains pending and is checked again automatically.
 Fixed-printer jobs also retry automatically after a filament shortage.
 
+Automatic selection evaluates all eligible printers for the candidate model,
+then prefers the smallest estimated filament remainder after the print. The
+rule uses the job's actual sliced consumption and inventory weights, without
+hard-coded gram thresholds. Known sufficient inventory ranks ahead of unknown
+weights; equal estimates retain the previous matcher order. Material, required
+color, preference-color quality, plate-clear and other eligibility checks still
+come first. An explicitly selected fixed printer remains fixed.
+
+Only feeds used by this job count towards its estimate. Repeated uses of one
+physical feed are aggregated; with Filament Backup enabled, each relevant
+material/extruder pool is counted once. Both internal inventory and Spoolman use
+the existing inventory resolution. Estimates reflect those recorded weights
+and the slice, rather than a physical weighing of the spool. Unrelated AMS
+spools do not inflate the ranking.
+
 Physical AMS slot IDs are recomputed for automatic assignments. Editing a job
 to move it to another fixed printer clears the old mapping unless the edit
 explicitly supplies a replacement. Explicit mappings on the same fixed printer

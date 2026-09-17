@@ -299,6 +299,7 @@ async def test_print_anyway_does_not_bypass_invalid_slot(farm):
 
 
 async def test_print_anyway_still_bypasses_weight(farm):
+    farm.states = {1: status()}
     await remaining(farm, 1, 1)
     await add_item(farm, skip_filament_check=True)
     assert (await run(farm)).called
@@ -385,3 +386,77 @@ async def test_selected_feed_produces_correct_p1s_wire_command(farm, tray, wire,
     assert command["ams_mapping"] == [wire]
     assert command["use_ams"] is enabled
     assert command["ams_mapping2"] == [{"ams_id": 255 if tray == 254 else 0, "slot_id": 0}]
+
+
+async def set_job_weight(farm, grams):
+    async with farm.sessions() as db:
+        library = await db.get(LibraryFile, 1)
+        with zipfile.ZipFile(library.file_path, "w") as archive:
+            archive.writestr(
+                "Metadata/slice_info.config",
+                f'<config><filament id="1" type="PETG" color="#FFFFFF" used_g="{grams}"/></config>',
+            )
+
+
+@pytest.mark.parametrize("required,smaller,larger", [(200, 250, 500), (735, 800, 1000), (42.5, 42.5, 85)])
+@pytest.mark.parametrize("tray", [0, 3, 254])
+async def test_automatic_selection_prefers_smallest_sufficient_spool(farm, required, smaller, larger, tray):
+    farm.states = {1: status(), 4: status()}
+    for pid in farm.states:
+        await change_feed(farm, pid, tray)
+    await set_job_weight(farm, required)
+    await remaining(farm, 1, larger)
+    await remaining(farm, 4, smaller)
+    await add_item(farm)
+    assert (await run(farm)).called
+    row = (await items(farm))[0]
+    assert row.printer_id == 4
+    assert json.loads(row.ams_mapping) == [tray]
+
+
+@pytest.mark.parametrize("skip_filament_check", [False, True])
+async def test_short_spool_is_not_preferred_to_sufficient_one(farm, skip_filament_check):
+    farm.states = {1: status(), 4: status()}
+    await remaining(farm, 1, 399)
+    await remaining(farm, 4, 450)
+    await add_item(farm, skip_filament_check=skip_filament_check)
+    await run(farm)
+    assert (await items(farm))[0].printer_id == 4
+
+
+async def test_unknown_weight_is_not_treated_as_empty(farm):
+    farm.states = {1: status(), 4: status()}
+    async with farm.sessions() as db:
+        (await db.get(Spool, 1)).label_weight = 0
+        await db.commit()
+    await remaining(farm, 4, 450)
+    await add_item(farm)
+    await run(farm)
+    assert (await items(farm))[0].printer_id == 4
+
+
+async def test_best_fit_keeps_plate_gate_and_fixed_printer_choice(farm):
+    farm.states = {1: status(), 4: status()}
+    await remaining(farm, 1, 900)
+    await remaining(farm, 4, 450)
+    farm.held.add(4)
+    await add_item(farm)
+    await run(farm)
+    assert (await items(farm))[0].printer_id == 1
+    farm.held.clear()
+    async with farm.sessions() as db:
+        await db.delete(await db.get(PrintQueueItem, 1))
+        await db.commit()
+    await add_item(farm, target_model=None, printer_id=1, ams_mapping="[254]")
+    await run(farm)
+    assert (await items(farm))[0].printer_id == 1
+
+
+async def test_batch_consumes_smallest_suitable_printers_first(farm):
+    farm.states = {1: status(), 3: status(), 4: status()}
+    for pid, grams in [(1, 900), (3, 650), (4, 450)]:
+        await remaining(farm, pid, grams)
+    for _ in range(3):
+        await add_item(farm)
+    await run(farm)
+    assert [row.printer_id for row in await items(farm)] == [4, 3, 1]
