@@ -1,0 +1,17 @@
+name: mechonix-bambuddy-source-test
+services:
+  queue-tests:
+    image: mechonix-bambuddy:queue-source-tests
+    build:
+      context: ../..
+      dockerfile: deploy/mechonix/Dockerfile.test
+    network_mode: none
+    environment:
+      DATABASE_URL: sqlite+aiosqlite:////tmp/queue-test-app.db
+      DATA_DIR: /tmp/queue-test-data
+      LOG_TO_FILE: 'false'
+    command:
+      - -q
+      - -p
+      - 'no:cacheprovider'
+      - backend/tests/unit/test_scheduler_filament_selection_mechonix.py

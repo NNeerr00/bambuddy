@@ -77,6 +77,7 @@ import { formatFileSize } from '../utils/file';
 import { assignableProjects } from '../utils/projectTree';
 import { openInSlicer, resolveDesktopSlicer, type SlicerType } from '../utils/slicer';
 import { isSlicedLibraryFile, isSliceableLibraryFile } from '../utils/libraryFiles';
+import { useMechonixPrintLink } from '../hooks/useMechonixPrintLink';
 
 type SortField = 'name' | 'date' | 'size' | 'type' | 'prints';
 type SortDirection = 'asc' | 'desc';
@@ -1114,6 +1115,14 @@ export function FileManagerPage() {
       setSelectedFolderId(newFolderId);
     }
   }, [searchParams]);
+
+  const openMechonixPrint = useCallback((file: LibraryFileListItem) => {
+    setSelectedFiles([]);
+    setSelectedFolderId(file.folder_id ?? null);
+    setPrintFile(file);
+  }, []);
+  const failMechonixPrint = useCallback((message: string) => showToast(message, 'error'), [showToast]);
+  useMechonixPrintLink(searchParams.get('mechonix_print'), hasPermission('queue:create'), openMechonixPrint, failMechonixPrint);
 
   // Queries
   const { data: settings } = useQuery({

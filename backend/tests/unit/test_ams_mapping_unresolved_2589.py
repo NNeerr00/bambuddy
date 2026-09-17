@@ -113,6 +113,7 @@ class TestEnsureAmsMapping:
         item = MagicMock()
         item.id = 92
         item.printer_id = 82
+        item.target_model = None
         item.ams_mapping = ams_mapping
         return item
 

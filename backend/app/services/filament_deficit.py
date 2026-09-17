@@ -547,8 +547,14 @@ async def build_slot_materials(db: AsyncSession, printer_id: int) -> list[SlotMa
 async def compute_deficit_for_queue_item(
     db: AsyncSession,
     item: PrintQueueItem,
+    *,
+    refresh_item: bool = True,
 ) -> list[FilamentDeficit]:
     """Return per-slot filament shortfalls for ``item``, or [] when it's safe to dispatch.
+
+    ``refresh_item=False`` is reserved for the scheduler's detached candidate
+    probes. Their source relationships are already resolved, and looking up the
+    persisted row by ID would discard the candidate printer and its new mapping.
 
     Returns an empty list whenever any of the following hold:
 
@@ -579,15 +585,16 @@ async def compute_deficit_for_queue_item(
     # Refresh the relationships we need without assuming the caller eagerly
     # loaded them — both the route and the scheduler call this from contexts
     # with different loading strategies.
-    refreshed = await db.execute(
-        select(PrintQueueItem)
-        .options(
-            selectinload(PrintQueueItem.archive),
-            selectinload(PrintQueueItem.library_file),
+    if refresh_item:
+        refreshed = await db.execute(
+            select(PrintQueueItem)
+            .options(
+                selectinload(PrintQueueItem.archive),
+                selectinload(PrintQueueItem.library_file),
+            )
+            .where(PrintQueueItem.id == item.id)
         )
-        .where(PrintQueueItem.id == item.id)
-    )
-    item = refreshed.scalar_one_or_none() or item
+        item = refreshed.scalar_one_or_none() or item
 
     source_path = _resolve_source_3mf(item)
     if source_path is None:

@@ -3,7 +3,7 @@
 ``PrintScheduler._block_on_filament_deficit`` is the gate that keeps an
 auto_dispatch=True VP intake (or any other scheduler-driven dispatch) from
 sending a print onto a spool that can't satisfy it. On a deficit it
-promotes the item to manual_start; when a previously-flagged item's spool
+keeps the item automatically pending; when a previously-flagged item's spool
 is now adequate it clears the flag so the next tick dispatches.
 """
 
@@ -47,7 +47,7 @@ def queue_item(db_session, printer_factory):
 
 
 @pytest.mark.asyncio
-async def test_blocks_on_deficit_promotes_to_manual_start(scheduler, db_session, queue_item):
+async def test_blocks_on_deficit_without_promoting_to_manual_start(scheduler, db_session, queue_item):
     item = await queue_item()
     with patch(
         "backend.app.services.print_scheduler.compute_deficit_for_queue_item",
@@ -68,8 +68,9 @@ async def test_blocks_on_deficit_promotes_to_manual_start(scheduler, db_session,
 
     assert blocked is True
     await db_session.refresh(item)
-    assert item.manual_start is True
+    assert item.manual_start is False
     assert item.filament_short is True
+    assert "retrying automatically" in item.waiting_reason
 
 
 @pytest.mark.asyncio
@@ -105,8 +106,8 @@ async def test_no_deficit_no_op(scheduler, db_session, queue_item):
 
 
 @pytest.mark.asyncio
-async def test_helper_exception_does_not_wedge_dispatch(scheduler, db_session, queue_item):
-    """A flaky deficit check (e.g. Spoolman timeout) must not block dispatch."""
+async def test_helper_exception_waits_without_wedging_manual_start(scheduler, db_session, queue_item):
+    """Failed checks defer automatically rather than sending an unverified job."""
     item = await queue_item()
     with patch(
         "backend.app.services.print_scheduler.compute_deficit_for_queue_item",
@@ -114,9 +115,11 @@ async def test_helper_exception_does_not_wedge_dispatch(scheduler, db_session, q
     ):
         blocked = await scheduler._block_on_filament_deficit(db_session, item)
 
-    assert blocked is False
+    assert blocked is True
     await db_session.refresh(item)
     assert item.filament_short is False
+    assert item.manual_start is False
+    assert "retrying automatically" in item.waiting_reason
 
 
 @pytest.mark.asyncio

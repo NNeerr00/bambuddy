@@ -29,3 +29,8 @@ docker build -f deploy/mechonix/Dockerfile.production-snapshot \
 The queued-filament fixes are deliberately absent from this snapshot. They are
 developed on a separate branch. Creating this snapshot does not restart or change
 the running service.
+
+On the subsequent queue-fix branch, the Restock feature is ported to TypeScript
+and the regular Dockerfile builds the updated application directly from source.
+See `QUEUE_FIX.md` for that change. The files in `production-static/` and their
+manifest continue to describe the original deployed snapshot.

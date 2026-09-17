@@ -303,6 +303,9 @@ async def _run_check_queue(ctx, scheduler, finder, waiting_notification=None):
         # sentinel, which the unmappable guard (#2771) reads as "this job can
         # never print" and fails the item on.
         patch.object(scheduler, "_ensure_ams_mapping", AsyncMock(return_value=None)),
+        patch.object(scheduler, "_compute_ams_mapping_for_printer", AsyncMock(return_value=[254])),
+        patch.object(scheduler, "_mapping_problem", AsyncMock(return_value=None)),
+        patch("backend.app.services.print_scheduler.compute_deficit_for_queue_item", AsyncMock(return_value=[])),
         patch.object(scheduler, "_block_on_filament_deficit", AsyncMock(return_value=False)),
         patch.object(scheduler, "_launch_uploads", MagicMock()),
     ]
@@ -321,7 +324,7 @@ def _finder_for(available: dict[str, int]):
     """Matcher that offers a printer only for the listed models."""
 
     async def _find(db, model, exclude_ids, *args, **kwargs):
-        if model in available:
+        if model in available and available[model] not in exclude_ids:
             return available[model], None
         return None, f"No idle {model} printer"
 
@@ -353,7 +356,7 @@ async def test_first_matching_variant_wins_and_is_folded_onto_the_row(queue_db):
     assert item.printer_id == 2, "assigned to the H2C"
     assert item.target_model == "H2C"
     assert item.plate_id == 3
-    assert item.ams_mapping == "[4, 5]"
+    assert item.ams_mapping == "[254]", "physical trays are derived for the selected printer"
     assert item.nozzle_mapping == "[0, 1]"
     assert item.print_time_seconds == 1200, "the estimate now describes what will actually run"
     assert item.waiting_reason is None

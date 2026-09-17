@@ -1979,6 +1979,11 @@ async def update_queue_item(
     if "ams_mapping" in update_data:
         update_data["ams_mapping"] = json.dumps(update_data["ams_mapping"]) if update_data["ams_mapping"] else None
 
+    # Physical slots belong to one printer. Keep an explicit replacement only
+    # for a fixed target; automatic jobs resolve slots when selecting a printer.
+    if new_target_model or (new_printer_id != item.printer_id and "ams_mapping" not in update_data):
+        update_data["ams_mapping"] = None
+
     # Serialize filament_overrides to JSON for TEXT column storage, keeping only
     # the slots this item's plate actually prints (#2551 — same shared-override
     # list the create path narrows).

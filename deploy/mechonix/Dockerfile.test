@@ -1,0 +1,6 @@
+# Reuse the pinned runtime's dependencies, but test this checkout's source.
+# No application patching, startup, production volumes or network access.
+FROM ghcr.io/maziggy/bambuddy@sha256:dc627d618cc3d3252ae4ab33af74c4679c66a9a06e0e3bbb7aefa32d1a4d4a07
+COPY backend/ /app/backend/
+COPY pyproject.toml /app/pyproject.toml
+ENTRYPOINT ["python", "-m", "pytest"]
