@@ -1,3 +1,5 @@
 # Force CRLF line endings for Windows batch files so cmd.exe can parse them
 # regardless of the user's core.autocrlf setting.
 *.bat text eol=crlf
+# Preserve historical deployed frontend bytes (including embedded shader whitespace).
+deploy/mechonix/production-static/** -text -diff -whitespace linguist-generated=true
