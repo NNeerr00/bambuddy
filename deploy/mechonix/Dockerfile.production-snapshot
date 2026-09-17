@@ -1,0 +1,7 @@
+# Exact application snapshot of the service running on 2026-09-17.
+# The pinned parent supplies the same dependencies as production.
+# All application changes are ordinary, versioned source files: no patch scripts.
+FROM ghcr.io/maziggy/bambuddy@sha256:dc627d618cc3d3252ae4ab33af74c4679c66a9a06e0e3bbb7aefa32d1a4d4a07
+COPY backend/app/ /app/backend/app/
+COPY deploy/mechonix/production-static/ /app/static/
+COPY requirements.txt /app/requirements.txt

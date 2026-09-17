@@ -2981,22 +2981,42 @@ async def configure_ams_slot(
     if effective_tray_info_idx and not effective_setting_id:
         effective_setting_id = filament_id_to_setting_id(effective_tray_info_idx)
 
-    # Always send ams_set_filament_setting — the user explicitly clicked
-    # "Configure Slot", so honor that.  Previous versions skipped this for
-    # RFID-tagged slots to preserve the slicer eye icon, but printers cache
-    # stale tag_uid/tray_uuid after a BL spool is removed, causing the check
-    # to false-positive on non-RFID slots and silently drop the command.
-    success = client.ams_set_filament_setting(
-        ams_id=ams_id,
-        tray_id=tray_id,
-        tray_info_idx=effective_tray_info_idx,
-        tray_type=tray_type,
-        tray_sub_brands=tray_sub_brands,
-        tray_color=tray_color,
-        nozzle_temp_min=nozzle_temp_min,
-        nozzle_temp_max=nozzle_temp_max,
-        setting_id=effective_setting_id,
+    # Selecting a K profile for an already configured external slot must not
+    # resend ams_set_filament_setting. The firmware processes that command
+    # asynchronously and can reset a following extrusion_cali_sel to -1.
+    from backend.app.services.external_spool_merge import external_slot_matches
+
+    state = printer_manager.get_status(printer_id)
+    skip_filament_setting = bool(
+        ams_id == 255
+        and cali_idx >= 0
+        and state
+        and state.raw_data
+        and external_slot_matches(
+            state.raw_data.get("vt_tray"),
+            tray_id,
+            effective_tray_info_idx,
+            tray_type,
+            tray_color,
+        )
     )
+    if skip_filament_setting:
+        logger.info(
+            "[configure_ams_slot] external filament context already active; selecting K profile only"
+        )
+        success = True
+    else:
+        success = client.ams_set_filament_setting(
+            ams_id=ams_id,
+            tray_id=tray_id,
+            tray_info_idx=effective_tray_info_idx,
+            tray_type=tray_type,
+            tray_sub_brands=tray_sub_brands,
+            tray_color=tray_color,
+            nozzle_temp_min=nozzle_temp_min,
+            nozzle_temp_max=nozzle_temp_max,
+            setting_id=effective_setting_id,
+        )
 
     if not success:
         raise HTTPException(status_code=500, detail="Failed to send filament configuration command")
@@ -3020,12 +3040,9 @@ async def configure_ams_slot(
     # hardcoded extruder_id=0 and nozzle_id=HS00.
     if k_value > 0 and cali_idx < 0:
         # Calculate global tray ID for extrusion_cali_set
-        if ams_id <= 3:
-            global_tray_id = ams_id * 4 + tray_id
-        elif ams_id >= 128 and ams_id <= 135:
-            global_tray_id = (ams_id - 128) * 4 + tray_id
-        else:
-            global_tray_id = tray_id
+        from backend.app.services.external_spool_merge import external_k_profile_tray_id
+
+        global_tray_id = external_k_profile_tray_id(ams_id, tray_id)
 
         client.extrusion_cali_set(
             tray_id=global_tray_id,

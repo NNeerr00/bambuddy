@@ -2241,6 +2241,8 @@ class BambuMQTTClient:
                 except Exception as e:
                     logger.error("[%s] Error handling AMS data from print: %s", self.serial_number, e)
 
+            from backend.app.services.external_spool_merge import merge_external_spools
+
             # Handle vir_slot (H2-series external spool data) — list of external trays
             # Process vir_slot FIRST so it takes priority over vt_tray
             if "vir_slot" in print_data:
@@ -2252,7 +2254,7 @@ class BambuMQTTClient:
                     # Dual-nozzle (H2D) has 2 slots: id=254 (Ext-L) and id=255 (Ext-R).
                     if len(vir_slot) == 1 and str(vir_slot[0].get("id", "")) == "255":
                         vir_slot[0]["id"] = "254"
-                    self.state.raw_data["vt_tray"] = vir_slot
+                    self.state.raw_data["vt_tray"] = merge_external_spools(self.state.raw_data.get("vt_tray"), vir_slot)
 
             # Handle vt_tray (virtual tray / external spool) data
             # Only use vt_tray if vir_slot is NOT in this message AND we don't already
@@ -2267,7 +2269,7 @@ class BambuMQTTClient:
                 else:
                     if isinstance(vt_tray, dict):
                         vt_tray = [vt_tray]
-                    self.state.raw_data["vt_tray"] = vt_tray
+                    self.state.raw_data["vt_tray"] = merge_external_spools(existing, vt_tray)
 
             # The regular AMS change-hash (in _handle_ams_data) only sees AMS
             # units, and _handle_ams_data runs before this block — so a change
@@ -6779,6 +6781,7 @@ class BambuMQTTClient:
         setting_id: str | None = None,
         slot_id: int = 0,
         cali_idx: int | None = None,
+        n_coef: str = "0.000000",
     ) -> str | None:
         """Set/update a K-profile on the printer.
 
@@ -6826,7 +6829,7 @@ class BambuMQTTClient:
             "extruder_id": extruder_id,
             "filament_id": filament_id,
             "k_value": k_value,
-            "n_coef": "0.000000",
+            "n_coef": n_coef,
             "name": name,
             "nozzle_diameter": nozzle_diameter,
             "nozzle_id": nozzle_id,
@@ -7830,16 +7833,10 @@ class BambuMQTTClient:
         if ams_id == 255:
             # External spool: extrusion_cali_sel uses GLOBAL tray_id (unlike
             # ams_filament_setting which uses LOCAL tray_id=0).
+            from backend.app.services.external_spool_merge import external_cali_sel_wire_ids
+
             vt_tray = self.state.raw_data.get("vt_tray", []) if self.state.raw_data else []
-            if len(vt_tray) > 1:
-                # Dual external slots (H2D): each ext slot is its own virtual AMS unit
-                # Confirmed from BambuStudio logs: ext-R sends ams_id=255, tray_id=255
-                mqtt_ams_id = 254 + tray_id
-                mqtt_tray_id = 254 + tray_id
-            else:
-                # Single external slot (X1C, P1S, A1): global tray_id=254
-                mqtt_ams_id = 254
-                mqtt_tray_id = 254
+            mqtt_ams_id, mqtt_tray_id = external_cali_sel_wire_ids(len(vt_tray), tray_id)
             slot_id = 0
         elif ams_id <= 3:
             mqtt_ams_id = ams_id

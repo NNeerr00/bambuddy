@@ -163,7 +163,8 @@ async def set_kprofile(
             nozzle_diameter=profile.nozzle_diameter,
             nozzle_id=profile.nozzle_id,
             extruder_id=profile.extruder_id,
-            setting_id=None,  # Generate new setting_id for add
+            setting_id=profile.setting_id,
+            n_coef=profile.n_coef,
             slot_id=0,  # Always 0 for add (new profile)
         )
     else:
@@ -175,7 +176,8 @@ async def set_kprofile(
             nozzle_diameter=profile.nozzle_diameter,
             nozzle_id=profile.nozzle_id,
             extruder_id=profile.extruder_id,
-            setting_id=None,  # Generate new setting_id for add
+            setting_id=profile.setting_id,
+            n_coef=profile.n_coef,  # Generate new setting_id for add
             slot_id=0,  # Always 0 for add (new profile)
         )
 
