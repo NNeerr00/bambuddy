@@ -72,6 +72,7 @@ docker compose -f deploy/mechonix/compose.test.yaml build
 docker compose -f deploy/mechonix/compose.test.yaml run --rm queue-tests \
   -q -p no:cacheprovider \
   backend/tests/unit/test_scheduler_filament_selection_mechonix.py \
+  backend/tests/unit/services/test_filament_leftover.py \
   backend/tests/unit/test_scheduler_filament_deficit.py \
   backend/tests/unit/test_scheduler_ams_mapping.py \
   backend/tests/unit/test_scheduler_clear_plate.py \
@@ -87,3 +88,9 @@ tests cover both AMS and external-feed commands. Ten Restock-link frontend
 tests passed; ESLint and the full TypeScript/Vite build with Safari baseline
 validation passed. No print was sent and the production service was not
 restarted during these checks. Hardware confirmation remains a rollout check.
+
+The subsequent leftover-priority update passed 274 tests in its production
+image on 2026-09-17, including variable-weight selection, AMS/external feeds,
+unknown weights, repeated feed usage and backup-pool accounting. Deployment
+health and all 18 active prints were verified after the restart. See
+`deployment-20260917-bestfit.json` for the deployed image and source hashes.
