@@ -1,7 +1,7 @@
 name: mechonix-bambuddy-source-test
 services:
   queue-tests:
-    image: mechonix-bambuddy:queue-source-tests
+    image: ${BAMBUDDY_TEST_IMAGE:-mechonix-bambuddy:queue-source-tests}
     build:
       context: ../..
       dockerfile: deploy/mechonix/Dockerfile.test
