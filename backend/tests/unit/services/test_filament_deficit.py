@@ -397,6 +397,43 @@ class TestFilamentDeficitBackupAware:
     firmware switches mid-print, so the deficit shouldn't fire.
     """
 
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("home_flag", [6505791, 6505791 & ~(1 << 10), None])
+    async def test_p1_status_and_print_ack_control_pooling(self, db_session, printer_factory, tmp_path, home_flag):
+        """3-4 incident: neither spool covers 248.3g alone; together they do."""
+        from backend.app.services.bambu_mqtt import BambuMQTTClient
+
+        printer = await printer_factory(model="P1S")
+        archive = await _setup_archive_3mf(
+            db_session, tmp_path, [{"id": "1", "type": "PLA", "color": "#FFFFFF", "used_g": "248.3"}]
+        )
+        for tray_id, remaining in ((1, 212.81), (2, 239.68)):
+            spool = await _spool(
+                db_session, label_weight=1000, weight_used=1000 - remaining, color="#FFFFFF", slicer_filament="GFL99"
+            )
+            await _assign(db_session, printer_id=printer.id, spool_id=spool.id, ams_id=0, tray_id=tray_id)
+        item = await _queue_item(db_session, printer_id=printer.id, archive=archive, ams_mapping=[1])
+
+        client = BambuMQTTClient(ip_address="192.0.2.1", serial_number="TEST", access_code="test")
+        status = {"command": "push_status"}
+        if home_flag is not None:
+            status["home_flag"] = home_flag
+        client._process_message({"print": status})
+        client._process_message({"print": {"command": "project_file", "cfg": "0", "result": "success"}})
+        with (
+            patch("backend.app.services.filament_deficit.app_settings.base_dir", Path("/")),
+            patch("backend.app.services.printer_manager.printer_manager.get_status", return_value=client.state),
+            patch("backend.app.services.printer_manager.printer_manager.get_model", return_value="P1S"),
+        ):
+            deficit = await compute_deficit_for_queue_item(db_session, item)
+
+        if home_flag == 6505791:
+            assert deficit == []
+        else:
+            assert len(deficit) == 1
+            assert deficit[0].remaining_grams == pytest.approx(212.81)
+            assert deficit[0].required_grams == pytest.approx(248.3)
+
     @staticmethod
     def _patch_status(
         *,

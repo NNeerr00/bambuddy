@@ -6918,7 +6918,8 @@ class TestAmsFilamentBackupHoldTimer:
         client._client = MagicMock()
         return client
 
-    def test_cfg_push_with_old_value_is_ignored_during_hold(self, mqtt_client):
+    @pytest.mark.parametrize("status", [{"cfg": "C0340BC219"}, {"home_flag": 0}])
+    def test_cfg_push_with_old_value_is_ignored_during_hold(self, mqtt_client, status):
         # User toggled ON via badge → command sent → state optimistically set.
         mqtt_client.set_ams_filament_backup(True)
         assert mqtt_client.state.ams_filament_backup is True
@@ -6926,17 +6927,18 @@ class TestAmsFilamentBackupHoldTimer:
         # Within the 3 s hold window, a stale push_status arrives still showing
         # the printer's old cfg (bit 18 cleared). The parser must NOT flip our
         # optimistic state back to OFF — otherwise the badge flickers ON→OFF→ON.
-        mqtt_client._process_message({"print": {"cfg": "C0340BC219"}})  # bit18=0
+        mqtt_client._process_message({"print": {"command": "push_status", **status}})
         assert mqtt_client.state.ams_filament_backup is True
 
-    def test_cfg_push_after_hold_expires_overrides_state(self, mqtt_client):
+    @pytest.mark.parametrize("status", [{"cfg": "C0340BC219"}, {"home_flag": 0}])
+    def test_cfg_push_after_hold_expires_overrides_state(self, mqtt_client, status):
         # After the hold window, the printer's real cfg becomes authoritative
         # so a genuine slicer-side or display toggle that we did NOT initiate
         # propagates correctly.
         mqtt_client.set_ams_filament_backup(True)
         mqtt_client._xcam_hold_start["print_option_auto_switch_filament"] = time.time() - 10.0
 
-        mqtt_client._process_message({"print": {"cfg": "C0340BC219"}})  # bit18=0
+        mqtt_client._process_message({"print": {"command": "push_status", **status}})
         assert mqtt_client.state.ams_filament_backup is False
 
     def test_cfg_push_with_matching_value_during_hold_is_a_noop(self, mqtt_client):

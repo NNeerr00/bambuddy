@@ -84,6 +84,25 @@ def parse_ams_filament_backup_from_cfg(cfg_raw: object) -> bool | None:
         return None
 
 
+def parse_ams_filament_backup_from_status(print_data: dict) -> bool | None:
+    """Read auto-refill from status telemetry, never from command replies.
+
+    Modern firmware uses hex cfg bit 18; P1 firmware uses integer home_flag
+    bit 10 (BambuStudio DeviceManager::parse_home_flag). A project_file ACK
+    can echo the command's cfg="0", which is NOT the printer's configuration.
+    Missing fields in incremental updates leave the last known state intact.
+    """
+    if print_data.get("command") not in (None, "push_status"):
+        return None
+    backup = parse_ams_filament_backup_from_cfg(print_data.get("cfg"))
+    if backup is not None:
+        return backup
+    home_flag = print_data.get("home_flag")
+    if type(home_flag) is int:
+        return bool((home_flag >> 10) & 1)
+    return None
+
+
 # ── A2L "AMS Lite" unit-id normalisation (issue capture 2026-07-20) ──────────
 # The A2L reports its 4-slot AMS Lite as physical unit **id 16**, but the
 # firmware is internally inconsistent about it:
@@ -2191,16 +2210,14 @@ class BambuMQTTClient:
                     f"gcode_file: {print_data.get('gcode_file')}, subtask_name: {print_data.get('subtask_name')}"
                 )
 
-            # AMS Filament Backup state lives in bit 18 of top-level print.cfg on
-            # new-protocol printers. Verified against OrcaSlicer's
-            # DeviceManager.cpp:4961 SetAutoRefillEnabled(get_flag_bits(cfg, 18))
-            # and live H2D ON/OFF capture 2026-06-20.
+            # Read both firmware status formats and exclude command ACKs:
+            # project_file's cfg="0" must not disable backup accounting.
             #
             # Hold-timer guard: when the user just toggled via the badge, the
             # next 1-2 push_status frames may still carry the printer's OLD cfg
             # for ~3 s before the firmware reflects the change. Without this
             # gate the UI would flicker ON→OFF→ON. Same pattern xcam uses.
-            new_backup = parse_ams_filament_backup_from_cfg(print_data.get("cfg"))
+            new_backup = parse_ams_filament_backup_from_status(print_data)
             if new_backup is not None and new_backup != self.state.ams_filament_backup:
                 hold_start = self._xcam_hold_start.get("print_option_auto_switch_filament")
                 if hold_start is not None and (time.time() - hold_start) <= self._xcam_hold_time:
