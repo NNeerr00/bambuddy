@@ -1,0 +1,40 @@
+{
+  "deployed_date": "2026-09-23",
+  "application_revision": "537cca828a78d786e7b0019bd6582bd0c3c4e8d8",
+  "image": "mechonix-bambuddy:queue-537cca82",
+  "previous_image": "mechonix-bambuddy:queue-490081af",
+  "tests": {
+    "passed": 293,
+    "seconds": 42.86,
+    "runtime": "rebuilt production image, isolated test container"
+  },
+  "checks": {
+    "health": "healthy",
+    "frontend_http_status": 200,
+    "frontend_identified_as_bambuddy": true,
+    "deployed_source_hashes_match": true,
+    "connected_printers": 18,
+    "previously_offline_printers": 1,
+    "running_queue_ids_unchanged": [
+      991,
+      993,
+      1016,
+      992,
+      895,
+      896,
+      1022,
+      897,
+      1015,
+      1013,
+      914,
+      942,
+      989,
+      1065,
+      1064,
+      1014
+    ]
+  },
+  "backup": "/home/ubuntu/diagnostics/bambuddy-assigned-20260923/bambuddy.before.db",
+  "backup_quick_check": "ok",
+  "schema_migration": false
+}

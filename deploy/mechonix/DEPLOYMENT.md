@@ -1,7 +1,7 @@
 # Mechonix source deployment
 
-Application revision: `490081af` on `fix/queue-filament-selection`.
-Image: `mechonix-bambuddy:queue-490081af`.
+Application revision: `537cca82` on `fix/queue-filament-selection`.
+Image: `mechonix-bambuddy:queue-537cca82`.
 
 The host's base Compose file continues to own network settings, environment,
 restart policy and the existing external data/log volumes. The override here
@@ -18,7 +18,7 @@ docker compose -p bambuddy \
 ```
 
 Test the resulting image with the isolated suite described in `QUEUE_FIX.md`:
-set `BAMBUDDY_TEST_IMAGE=mechonix-bambuddy:queue-490081af`, use `run --rm
+set `BAMBUDDY_TEST_IMAGE=mechonix-bambuddy:queue-537cca82`, use `run --rm
 --entrypoint python queue-tests -m pytest -o asyncio_mode=auto`,
 then append the listed test paths. The test service has no network or production
 volume mounts. This also exercises the rebuilt runtime's dependencies.
@@ -40,10 +40,10 @@ and startup logs. Compare deployed source hashes with this checkout. Already
 running prints execute on the printers during the brief management restart.
 Existing manual queue holds are not automatically released.
 
-Rollback of the leftover-priority update uses the retained image
-`mechonix-bambuddy:queue-b2e4070b` with the
+Rollback of the required-spool-assignment update uses the retained image
+`mechonix-bambuddy:queue-490081af` with the
 previous Compose override, saved under
-`/home/ubuntu/diagnostics/bambuddy-bestfit-20260917/compose.override.before.yaml`.
+`/home/ubuntu/diagnostics/bambuddy-assigned-20260923/compose.override.before.yaml`.
 Stop the new service gracefully and restore that host override before running
 Compose with the base file and restored override. Keep the same data volumes;
 this change introduces no database schema migration. Do not overwrite current
