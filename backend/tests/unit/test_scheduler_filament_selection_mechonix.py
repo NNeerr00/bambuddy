@@ -460,3 +460,82 @@ async def test_batch_consumes_smallest_suitable_printers_first(farm):
         await add_item(farm)
     await run(farm)
     assert [row.printer_id for row in await items(farm)] == [4, 3, 1]
+
+
+@pytest.mark.parametrize("tray", [0, 3, 128, 254])
+@pytest.mark.parametrize("skip_weight_check", [False, True])
+async def test_unassigned_used_feed_waits_even_with_print_anyway(farm, tray, skip_weight_check):
+    from sqlalchemy import delete
+
+    from backend.app.models.settings import Settings
+
+    await change_feed(farm, 1, tray)
+    async with farm.sessions() as db:
+        await db.execute(delete(SpoolAssignment).where(SpoolAssignment.printer_id == 1))
+        db.add(Settings(key="disable_filament_warnings", value="true"))
+        await db.commit()
+    await add_item(
+        farm, printer_id=1, target_model=None, ams_mapping=json.dumps([tray]), skip_filament_check=skip_weight_check
+    )
+    await run(farm)
+    row = (await items(farm))[0]
+    assert row.status == "pending"
+    assert "No inventory spool assigned" in row.waiting_reason
+    assert not row.manual_start
+
+    # A subsequent assignment unblocks the same job on the next pass.
+    async with farm.sessions() as db:
+        db.add(
+            SpoolAssignment(
+                spool_id=1,
+                printer_id=1,
+                ams_id=255 if tray >= 254 else tray if tray >= 128 else tray // 4,
+                tray_id=tray - 254 if tray >= 254 else 0 if tray >= 128 else tray % 4,
+            )
+        )
+        await db.commit()
+    launch = await run(farm)
+    assert launch.call_count == 1
+    assert launch.call_args.args[0]
+
+
+async def test_auto_candidate_without_assignment_is_skipped_for_assigned_printer(farm):
+    from sqlalchemy import delete
+
+    async with farm.sessions() as db:
+        await db.execute(delete(SpoolAssignment).where(SpoolAssignment.printer_id == 1))
+        await db.commit()
+    await add_item(farm, skip_filament_check=True)
+    await run(farm)
+    row = (await items(farm))[0]
+    assert row.printer_id in (2, 3, 4, 5)
+    assert not row.manual_start
+
+
+@pytest.mark.parametrize("remove", ["unassign", "archive"])
+async def test_assignment_removed_during_upload_blocks_final_send(farm, remove):
+    from sqlalchemy import delete
+
+    item_id = await add_item(farm, printer_id=1, target_model=None, ams_mapping="[254]", skip_filament_check=True)
+    scheduler = PrintScheduler()
+    with mocked_farm(farm, scheduler):
+        async with farm.sessions() as db:
+            row = await db.get(PrintQueueItem, item_id)
+            assert await scheduler._mapping_problem(db, 1, row) is None
+            if remove == "unassign":
+                await db.execute(delete(SpoolAssignment).where(SpoolAssignment.printer_id == 1))
+            else:
+                spool = await db.get(Spool, 1)
+                spool.archived_at = datetime.now(timezone.utc)
+            await db.commit()
+            assert await scheduler._recheck_filament_before_send(db, row)
+            assert "No inventory spool assigned" in row.waiting_reason
+
+
+async def test_unused_mapping_entries_do_not_require_spools(farm):
+    item_id = await add_item(farm, printer_id=1, target_model=None, ams_mapping="[254, 0]")
+    scheduler = PrintScheduler()
+    with mocked_farm(farm, scheduler):
+        async with farm.sessions() as db:
+            row = await db.get(PrintQueueItem, item_id)
+            assert await scheduler._mapping_problem(db, 1, row) is None

@@ -94,3 +94,21 @@ image on 2026-09-17, including variable-weight selection, AMS/external feeds,
 unknown weights, repeated feed usage and backup-pool accounting. Deployment
 health and all 18 active prints were verified after the restart. See
 `deployment-20260917-bestfit.json` for the deployed image and source hashes.
+
+## Mandatory spool assignment (2026-09-23)
+
+Every feed actually used by a print must have an active inventory spool assigned
+on that printer. A physically detected filament without an inventory binding is
+not eligible. The scheduler checks candidate printers, fixed-printer jobs and
+manual-start jobs, and checks again after upload before sending the print command.
+Missing assignments leave the job pending with an explicit slot-specific reason;
+a later assignment lets the scheduler retry automatically. It does not turn the
+job into a manual hold. Neither Print Anyway nor disabled weight warnings bypass
+this requirement. Unused slots and unused mapping entries remain irrelevant.
+
+The built-in inventory rejects missing/deleted/archived spools. In Spoolman mode
+only Spoolman assignments count, and the referenced spool must be reachable and
+not archived. Unknown remaining weight remains a separate weight-check concern.
+No schema change or changes to existing assignments are required. Commands issued
+directly from the printer screen or another application are outside Bambuddy's
+dispatch path.

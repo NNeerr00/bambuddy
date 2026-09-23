@@ -59,6 +59,7 @@ from backend.app.services.printer_manager import (
     supports_drying_while_printing,
 )
 from backend.app.services.smart_plug_manager import smart_plug_manager
+from backend.app.services.spool_assignment_guard import spool_assignment_problem
 from backend.app.utils.color_utils import perceptual_color_distance
 from backend.app.utils.filament_types import canonical_filament_type
 from backend.app.utils.filename import derive_remote_filename
@@ -2852,6 +2853,7 @@ class PrintScheduler:
                 return "No used filament slot could be resolved"
             loaded = {f["global_tray_id"]: f for f in self._build_loaded_filaments(status)}
             fts = bool(getattr(getattr(status, "fila_switch", None), "installed", False))
+            used_feeds: set[int] = set()
             for req in requirements:
                 slot_id = req["slot_id"]
                 if type(slot_id) is not int or slot_id < 1 or slot_id > len(mapping):
@@ -2867,6 +2869,8 @@ class PrintScheduler:
                     return f"Filament slot {slot_id}: selected feed has the wrong color"
                 if req.get("nozzle_id") is not None and not fts and tray.get("extruder_id") != req["nozzle_id"]:
                     return f"Filament slot {slot_id}: selected feed belongs to another nozzle"
+                used_feeds.add(mapping[slot_id - 1])
+            return await spool_assignment_problem(db, printer_id, used_feeds)
         except (ValueError, TypeError, KeyError):
             return "Invalid filament mapping or requirements"
         return None
