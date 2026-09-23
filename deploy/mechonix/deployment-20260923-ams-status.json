@@ -1,0 +1,49 @@
+{
+  "deployed_date": "2026-09-23",
+  "application_revision": "f7144f347038aeb17a85e523b88e11cfc67dd8e6",
+  "image": "mechonix-bambuddy:queue-f7144f34",
+  "previous_image": "mechonix-bambuddy:queue-537cca82",
+  "tests": {
+    "source_regression_suite": {
+      "passed": 786,
+      "seconds": 44.61,
+      "runtime": "previous production image with updated backend mounted read-only; isolated from printer network and production data"
+    },
+    "rebuilt_image_ams_and_pooling_suite": {
+      "passed": 76,
+      "seconds": 19.33,
+      "runtime": "rebuilt production image, isolated test container"
+    },
+    "ruff_check": "passed",
+    "ruff_format_check": "passed",
+    "git_diff_check": "passed"
+  },
+  "checks": {
+    "health": "healthy",
+    "frontend_http_status": 200,
+    "frontend_identified_as_bambuddy": true,
+    "deployed_source_hash_matches": true,
+    "bambu_mqtt_sha256": "7c69facae7f25a90f23756322957d1fd9634b5181a4ba8a861c5fe5fa986e616",
+    "dispatches_in_flight_before_restart": 0,
+    "connected_printers_after_restart": 24,
+    "printers_reporting_running_after_restart": 24,
+    "printing_queue_ids_preserved": [895, 896, 897, 903, 904, 1018, 1019, 1020, 1021, 1064, 1065, 1067, 1071, 1073, 1119, 1208, 1214, 1215, 1216, 1217, 1218, 1219, 1225, 1227],
+    "printer_3_4": {
+      "id": 13,
+      "queue_id": 1225,
+      "state": "RUNNING",
+      "progress_before_restart": 2.0,
+      "progress_after_restart": 3.0,
+      "ams_filament_backup_after_restart": true,
+      "manual_toggle_after_restart": false,
+      "active_hms_errors": 0
+    },
+    "reported_backup_on_count": 23,
+    "reported_backup_off_printer": "4-4",
+    "reported_backup_unknown_count": 0
+  },
+  "backup": "/home/ubuntu/diagnostics/bambuddy-ams-status-20260923/bambuddy.before.db",
+  "backup_quick_check": "ok",
+  "schema_migration": false,
+  "limitations": "The historical print-start reply was not captured; the ACK regression is reproduced in tests. No extra print or physical spool runout was triggered for verification."
+}
