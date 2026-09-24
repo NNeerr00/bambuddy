@@ -1,0 +1,43 @@
+{
+  "deployed_date": "2026-09-24",
+  "application_revision": "0c164af77a07c19f29c1ac3a9b54ce0891d8cbcc",
+  "image": "mechonix-bambuddy:queue-0c164af7",
+  "previous_image": "mechonix-bambuddy:queue-f7144f34",
+  "tests": {
+    "old_parser_new_regressions": {"failed_as_expected": 4, "passed": 2},
+    "source_mqtt_and_queue_suite": {"passed": 518, "seconds": 16.74},
+    "rebuilt_image_mqtt_bridge_a2l_queue_suite": {"passed": 614, "seconds": 17.73},
+    "ruff_check": "passed",
+    "ruff_format_check": "passed",
+    "git_diff_check": "passed",
+    "frontend_build_and_browser_baseline": "passed"
+  },
+  "checks": {
+    "health": "healthy",
+    "frontend_http_status": 200,
+    "deployed_source_hash_matches": true,
+    "bambu_mqtt_sha256": "0507ce9c043f6887694c55b525b4eaa8097a42fc2726e3c653258d4b75d2a669",
+    "dispatches_in_flight_before_restart": 0,
+    "connected_printers_after_restart": 24,
+    "printing_queue_ids_preserved": [995, 1024, 1025, 1073, 1074, 1075, 1076, 1088, 1131, 1135, 1205, 1206, 1212, 1228, 1230, 1233, 1236, 1238, 1239, 1244, 1251, 1257, 1268, 1331],
+    "printer_3_5": {
+      "id": 11,
+      "state": "RUNNING",
+      "progress_before_restart": 24.0,
+      "progress_after_restart": 25.0,
+      "ams_id": 0,
+      "tray_id": 0,
+      "exists": true,
+      "material": "PLA",
+      "color": "FFFFFFFF",
+      "cali_idx": 730,
+      "assigned_spool_id": 59,
+      "assigned_barcode": "F000067",
+      "active_hms_errors": 0
+    }
+  },
+  "backup": "/home/ubuntu/diagnostics/bambuddy-slot-presence-20260924/bambuddy.before.db",
+  "backup_quick_check": "ok",
+  "schema_migration": false,
+  "limitations": "Original insertion MQTT frames were not captured. The parser defect was reproduced in isolation; no physical spool removal or additional print was triggered for verification."
+}

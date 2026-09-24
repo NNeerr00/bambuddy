@@ -1,11 +1,11 @@
 # Mechonix source deployment
 
-Application revision: `f7144f34` on `fix/queue-filament-selection`.
-Image: `mechonix-bambuddy:queue-f7144f34`.
+Application revision: `0c164af7` on `fix/queue-filament-selection`.
+Image: `mechonix-bambuddy:queue-0c164af7`.
 
-This release fixes AMS backup status ingestion on P1 printers and excludes
-print-command replies from configuration parsing. See `AMS_BACKUP_STATUS_FIX.md`
-for the incident, captured telemetry and regression coverage.
+This release fixes AMS presence-only updates that left QR assignments blocked
+by stale empty-slot status. See `AMS_SLOT_PRESENCE_FIX.md` for the incident
+and regression coverage. It retains the previous AMS backup status fixes.
 
 The host's base Compose file continues to own network settings, environment,
 restart policy and the existing external data/log volumes. The override here
@@ -22,7 +22,7 @@ docker compose -p bambuddy \
 ```
 
 Test the resulting image with the isolated suite described in `QUEUE_FIX.md`:
-set `BAMBUDDY_TEST_IMAGE=mechonix-bambuddy:queue-f7144f34`, use `run --rm
+set `BAMBUDDY_TEST_IMAGE=mechonix-bambuddy:queue-0c164af7`, use `run --rm
 --entrypoint python queue-tests -m pytest -o asyncio_mode=auto`,
 then append the listed test paths. The test service has no network or production
 volume mounts. This also exercises the rebuilt runtime's dependencies.
@@ -44,10 +44,10 @@ and startup logs. Compare deployed source hashes with this checkout. Already
 running prints execute on the printers during the brief management restart.
 Existing manual queue holds are not automatically released.
 
-Rollback of the AMS status update uses the retained image
-`mechonix-bambuddy:queue-537cca82` with the
+Rollback of the AMS presence update uses the retained image
+`mechonix-bambuddy:queue-f7144f34` with the
 previous Compose override, saved under
-`/home/ubuntu/diagnostics/bambuddy-ams-status-20260923/compose.override.before.yaml`.
+`/home/ubuntu/diagnostics/bambuddy-slot-presence-20260924/compose.override.before.yaml`.
 Stop the new service gracefully and restore that host override before running
 Compose with the base file and restored override. Keep the same data volumes;
 this change introduces no database schema migration. Do not overwrite current

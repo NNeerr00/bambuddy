@@ -1,10 +1,10 @@
 # Combine with /home/ubuntu/services/bambuddy/docker-compose.yml on this host.
 services:
   bambuddy:
-    image: mechonix-bambuddy:queue-f7144f34
+    image: mechonix-bambuddy:queue-0c164af7
     build:
       context: /home/ubuntu/bambuddy
       dockerfile: Dockerfile
       labels:
         org.opencontainers.image.source: https://github.com/NNeerr00/bambuddy
-        org.opencontainers.image.revision: f7144f347038aeb17a85e523b88e11cfc67dd8e6
+        org.opencontainers.image.revision: 0c164af77a07c19f29c1ac3a9b54ce0891d8cbcc
