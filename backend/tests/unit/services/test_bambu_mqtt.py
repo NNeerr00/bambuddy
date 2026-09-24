@@ -584,6 +584,57 @@ class TestAMSDataMerging:
         )
         return client
 
+    @pytest.mark.parametrize("bits_first", [False, True])
+    def test_insertion_presence_and_metadata_arrive_separately(self, mqtt_client, bits_first):
+        """A scanned P1S spool must not stay falsely empty until a full refresh."""
+        mqtt_client._handle_ams_data({"ams": [{"id": 0, "tray": [{"id": 0, "state": 9}]}], "tray_exist_bits": "0"})
+        presence = {"tray_exist_bits": "1"}
+        metadata = {"ams": [{"id": 0, "tray": [{"id": 0, "state": 3, "tray_type": "PLA"}]}]}
+        for update in [presence, metadata] if bits_first else [metadata, presence]:
+            mqtt_client._handle_ams_data(update)
+        tray = mqtt_client.state.raw_data["ams"][0]["tray"][0]
+        assert tray["exists"] is True
+        assert tray["state"] == 3
+        assert tray["tray_type"] == "PLA"
+
+    @pytest.mark.parametrize("bits", ["0", 0])
+    def test_presence_only_removal_clears_slot_and_notifies_inventory(self, mqtt_client, bits):
+        mqtt_client.on_ams_change = MagicMock()
+        mqtt_client._handle_ams_data(
+            {
+                "ams": [{"id": 0, "tray": [{"id": 0, "state": 3, "tray_type": "PLA", "remain": 80}]}],
+                "tray_exist_bits": "1",
+            }
+        )
+        mqtt_client.on_ams_change.reset_mock()
+        mqtt_client._handle_ams_data({"tray_exist_bits": bits})
+        tray = mqtt_client.state.raw_data["ams"][0]["tray"][0]
+        assert tray["exists"] is False
+        assert tray["state"] == 9
+        assert tray["tray_type"] == ""
+        assert tray["remain"] == 0
+        mqtt_client.on_ams_change.assert_called_once()
+
+    def test_presence_only_shutdown_preserves_loaded_slot(self, mqtt_client):
+        mqtt_client._handle_ams_data(
+            {
+                "ams": [{"id": 0, "tray": [{"id": 0, "state": 3, "tray_type": "PLA"}]}],
+                "tray_exist_bits": "1",
+            }
+        )
+        mqtt_client._handle_ams_data({"tray_exist_bits": "0", "power_on_flag": False})
+        tray = mqtt_client.state.raw_data["ams"][0]["tray"][0]
+        assert tray["exists"] is True
+        assert tray["state"] == 3
+        assert tray["tray_type"] == "PLA"
+
+    def test_presence_only_update_does_not_assume_filament_is_fed(self, mqtt_client):
+        mqtt_client._handle_ams_data({"ams": [{"id": 0, "tray": [{"id": 0, "state": 10}]}], "tray_exist_bits": "1"})
+        mqtt_client._handle_ams_data({"tray_exist_bits": "1"})
+        tray = mqtt_client.state.raw_data["ams"][0]["tray"][0]
+        assert tray["exists"] is True
+        assert tray["state"] == 10
+
     def test_empty_slot_clears_tray_type(self, mqtt_client):
         """Test that empty slot update clears tray_type (Issue #147).
 

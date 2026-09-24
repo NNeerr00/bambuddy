@@ -240,7 +240,7 @@ def apply_tray_exist_bits(
 
     Mutates ``units`` in place. Returns the number of slots cleared.
     """
-    if not tray_exist_bits_str:
+    if tray_exist_bits_str is None or tray_exist_bits_str == "":
         return 0
     try:
         if isinstance(tray_exist_bits_str, int):
@@ -3294,11 +3294,14 @@ class BambuMQTTClient:
             # NOTE: ams_status is parsed BEFORE tray_now (see above) to ensure correct
             # state when checking filament change mode for H2D disambiguation
 
-            # P1S/P1P send partial updates without "ams" key - this is valid, not an error
-            # We've already processed the status fields above, so just return if no ams list
+            # P1S/P1P can send presence bits separately from tray metadata.
+            # Apply those deltas to the cached trays through the normal merge
+            # path; otherwise an inserted spool keeps exists=False until pushall.
             if ams_list is None:
-                logger.debug("[%s] AMS partial update (no tray data)", self.serial_number)
-                return
+                if "tray_exist_bits" not in ams_data:
+                    logger.debug("[%s] AMS partial update (no tray data)", self.serial_number)
+                    return
+                ams_list = []
         elif isinstance(ams_data, list):
             ams_list = ams_data
             self._normalize_a2l_am_units(ams_list)
