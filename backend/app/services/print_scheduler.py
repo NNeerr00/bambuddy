@@ -1226,6 +1226,19 @@ class PrintScheduler:
             # generalises that workaround instead of repeating it per case.
             dispatching_printers: set[int] = set(busy_printers)
 
+            # Eligibility may disappear during a pass, but must not appear
+            # halfway through it. A plate-clear callback can otherwise release
+            # a printer after the high-priority rows were already checked and
+            # let a later row take it. Wait for the next pass, which starts at
+            # the queue head. Keep this separate from busy_printers: these
+            # printers are unavailable, not necessarily printing (auto-drying).
+            printer_result = await db.execute(select(Printer.id).where(Printer.is_active.is_(True)))
+            printer_ids = printer_result.scalars().all()
+            unavailable_at_start = {
+                pid for pid in printer_ids
+                if not printer_manager.is_connected(pid) or not self._is_printer_idle(pid, require_plate_clear)
+            }
+
             # Printers held by a Home Assistant sensor interlock (#1148) — an
             # enclosure door left open, say. The fixed-printer branch turns
             # this into a waiting_reason the user can act on; the model-based
@@ -1394,6 +1407,10 @@ class PrintScheduler:
                         busy_printers.add(item.printer_id)
                         continue
 
+                    if item.printer_id in unavailable_at_start:
+                        skip_reasons["ready_next_pass"] = skip_reasons.get("ready_next_pass", 0) + 1
+                        continue
+
                     # Drying blocks the queue, if the user asked it to. A hold
                     # is a skip like any other, so it belongs here with the
                     # rest of the availability checks.
@@ -1547,7 +1564,9 @@ class PrintScheduler:
                             db,
                             item,
                             candidate,
-                            busy_printers | interlocked.keys(),
+                            busy_printers | interlocked.keys() | {
+                                pid for pid in unavailable_at_start if printer_manager.is_connected(pid)
+                            },
                             effective_types,
                             filament_overrides,
                             require_plate_clear,
@@ -1764,7 +1783,13 @@ class PrintScheduler:
             # a slot freed mid-tick refills within seconds rather than after the
             # 30 s idle sleep (#2602). Selecting anything this pass (launched or
             # deferred because the pool was full) also counts as productive.
-            return bool(dispatch_ids) or bool(self._inflight)
+            # A plate freed mid-pass needs a prompt fresh scan from the head,
+            # rather than either losing its priority or waiting the idle sleep.
+            newly_ready = any(
+                printer_manager.is_connected(pid) and self._is_printer_idle(pid, require_plate_clear)
+                for pid in unavailable_at_start
+            )
+            return bool(dispatch_ids) or bool(self._inflight) or newly_ready
 
     def _launch_uploads(self, item_ids: list[int], item_printers: dict[int, int | None], limit: int) -> None:
         """Launch selected uploads as a refillable pool, capped at ``limit`` (#2602).

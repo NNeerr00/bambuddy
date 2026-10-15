@@ -12,6 +12,14 @@ printer, or a smaller job that fits on the remaining spool, can still run.
 If none qualifies, the job remains pending and is checked again automatically.
 Fixed-printer jobs also retry automatically after a filament shortage.
 
+A printer freed during an ongoing queue scan is only eligible in the next scan,
+which restarts at the highest queue position. Previously a plate-clear callback
+could let a later job take the newly available printer after earlier jobs had
+already been checked. This caused TP-Link 300018 to start on 2-2 on 2026-10-15
+while OOS jobs were pending. The scheduler now snapshots printer readiness per
+pass and promptly scans again if readiness changes. Live safety checks still
+apply before dispatch. Regression cases cover PLA/PETG in black and white.
+
 Automatic selection evaluates all eligible printers for the candidate model,
 then prefers the smallest estimated filament remainder after the print. The
 rule uses the job's actual sliced consumption and inventory weights, without

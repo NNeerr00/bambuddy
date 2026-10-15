@@ -287,6 +287,9 @@ async def _run_check_queue(ctx, scheduler, finder, waiting_notification=None):
         patch("backend.app.core.database.async_session", ctx.session_maker),
         patch("backend.app.services.print_scheduler.printer_manager.is_connected", MagicMock(return_value=True)),
         patch("backend.app.services.print_scheduler.printer_manager.get_status", MagicMock(return_value=None)),
+        # This fixture supplies eligible printers through its matcher rather
+        # than MQTT. Expose the same readiness to the per-pass snapshot.
+        patch.object(scheduler, "_is_printer_idle", MagicMock(return_value=True)),
         patch(
             "backend.app.services.notification_service.notification_service.on_queue_job_waiting",
             waiting_notification or AsyncMock(),

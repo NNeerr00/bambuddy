@@ -198,6 +198,46 @@ async def test_all_short_retries_after_spool_change(farm):
     assert row.printer_id == 3 and not row.filament_short and row.waiting_reason is None
 
 
+@pytest.mark.parametrize("material,color", [("PLA", "000000FF"), ("PLA", "FFFFFFFF"),
+                                            ("PETG", "000000FF"), ("PETG", "FFFFFFFF")])
+async def test_plate_clear_mid_pass_cannot_let_lower_priority_jump(farm, material, color):
+    """A plate freed after the head was checked must wait for a fresh pass."""
+    farm.states = {1: status(material=material, color=color)}
+    farm.held = {1}
+    async with farm.sessions() as db:
+        spool = await db.get(Spool, 1)
+        spool.material, spool.rgba = material, color
+        file = await db.get(LibraryFile, 1)
+        path = file.file_path
+        await db.commit()
+    with zipfile.ZipFile(path, "w") as archive:
+        archive.writestr("Metadata/slice_info.config",
+                         f'<config><filament id="1" type="{material}" color="#{color[:6]}" used_g="400"/></config>')
+    overrides = json.dumps([dict(slot_id=1, type=material, color=f"#{color}", force_color_match=True)])
+    first = await add_item(farm, position=1, required_filament_types=json.dumps([material]),
+                           filament_overrides=overrides)
+    lower = await add_item(farm, position=2, required_filament_types=json.dumps([material]),
+                           filament_overrides=overrides)
+    scheduler = PrintScheduler()
+    original = scheduler._find_filament_ready_printer
+
+    async def clear_after_head(db, item, *args, **kwargs):
+        result = await original(db, item, *args, **kwargs)
+        if item.id == first:
+            farm.held.discard(1)
+        return result
+
+    with patch.object(scheduler, "_find_filament_ready_printer", side_effect=clear_after_head):
+        launch = await run(farm, scheduler)
+    assert not launch.called
+    rows = {r.id: r for r in await items(farm)}
+    assert rows[first].printer_id is None and rows[lower].printer_id is None
+    launch = await run(farm, scheduler)
+    assert launch.call_args.args[0] == [first]
+    rows = {r.id: r for r in await items(farm)}
+    assert rows[first].printer_id == 1 and rows[lower].printer_id is None
+
+
 @pytest.mark.parametrize("tray", [0, 1, 2, 254])
 async def test_model_reassignment_discards_slot_four(farm, tray):
     farm.states = {1: status(tray)}
