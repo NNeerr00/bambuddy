@@ -1,0 +1,3 @@
+# Keep the deployed runtime and frontend; replace the versioned scheduler only.
+FROM mechonix-bambuddy:queue-0c164af7
+COPY backend/app/services/print_scheduler.py /app/backend/app/services/print_scheduler.py
