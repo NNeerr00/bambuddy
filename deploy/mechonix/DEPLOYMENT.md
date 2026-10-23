@@ -1,5 +1,26 @@
 # Mechonix source deployment
 
+Application revision: `8b0e8ac5` on `feat/obico-alert-photo`.
+Image: `mechonix-bambuddy:obico-telegram-8b0e8ac5` (`Dockerfile.obico-telegram`).
+
+Telegram AI failure alerts carry "⏸ Pausieren" and "⏹ Abbrechen" buttons.
+`telegram_actions.py` long-polls `getUpdates` (callback queries only) for each
+enabled Telegram provider with AI alerts; only presses from that provider's chat
+count, and only while the printer still runs the alerted job (fingerprint in the
+button). Stop asks no question (owner's choice) and marks the printer
+user-stopped. Do not attach another getUpdates consumer or a webhook to the same
+bot token: Telegram allows one, and the buttons would silently stop working.
+Layers `telegram_actions.py`, `notification_service.py` and `main.py` onto
+`obico-photo-1a4c4e72`. 2802 service tests passed in the built image.
+
+Verified live on 2026-10-23: `/health` OK, 36/36 printers reconnected, queue
+unchanged, deployed sources identical to this checkout, test alert with buttons
+delivered. Rollback: restore
+`/home/ubuntu/diagnostics/bambuddy-telegram-knoepfe-2026-10-23/compose.override.before.yaml`
+(image `mechonix-bambuddy:obico-photo-1a4c4e72`).
+
+## Previous release: obico-photo
+
 Application revision: `1a4c4e72` on `feat/obico-alert-photo`.
 Image: `mechonix-bambuddy:obico-photo-1a4c4e72` (`Dockerfile.obico-photo`).
 
