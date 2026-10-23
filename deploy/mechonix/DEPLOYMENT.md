@@ -1,5 +1,19 @@
 # Mechonix source deployment
 
+Application revision: `e7210b99` on `feat/obico-alert-photo`.
+Image: `mechonix-bambuddy:chamber-light-e7210b99` (`Dockerfile.chamber-light`).
+
+The chamber light blinks (1 s on, 1 s off) while a connected printer is in
+PAUSE or FAILED and returns to its previous state afterwards
+(`chamber_light_signal.py`, setting `chamber_light_signal_enabled`, enabled on
+this host). A P1S acknowledges the firmware "flashing" LED mode but ignores it,
+so Bambuddy toggles the light itself. Layers `chamber_light_signal.py`,
+`bambu_mqtt.py`, `schemas/settings.py` and `main.py` onto `obico-telegram-8b0e8ac5`.
+Deployed 2026-10-23 14:02: `/health` OK, 36/36 printers reconnected. Rollback:
+`/home/ubuntu/diagnostics/bambuddy-kammerlicht-2026-10-23/compose.override.before.yaml`.
+
+## Previous release: obico-telegram
+
 Application revision: `8b0e8ac5` on `feat/obico-alert-photo`.
 Image: `mechonix-bambuddy:obico-telegram-8b0e8ac5` (`Dockerfile.obico-telegram`).
 

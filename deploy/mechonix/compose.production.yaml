@@ -1,10 +1,10 @@
 # Combine with /home/ubuntu/services/bambuddy/docker-compose.yml on this host.
 services:
   bambuddy:
-    image: mechonix-bambuddy:obico-telegram-8b0e8ac5
+    image: mechonix-bambuddy:chamber-light-e7210b99
     build:
       context: /home/ubuntu/bambuddy
-      dockerfile: deploy/mechonix/Dockerfile.obico-telegram
+      dockerfile: deploy/mechonix/Dockerfile.chamber-light
       labels:
         org.opencontainers.image.source: https://github.com/NNeerr00/bambuddy
-        org.opencontainers.image.revision: 8b0e8ac559ba9287d3cb4aa5ad43bc7353534bc4
+        org.opencontainers.image.revision: e7210b998375dbdbbda93042b0cb31ce773e0194
