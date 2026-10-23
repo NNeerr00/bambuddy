@@ -1,5 +1,24 @@
 # Mechonix source deployment
 
+Application revision: `1a4c4e72` on `feat/obico-alert-photo`.
+Image: `mechonix-bambuddy:obico-photo-1a4c4e72` (`Dockerfile.obico-photo`).
+
+This release attaches the camera frame a failure was detected on to the Obico
+"Possible Print Failure Detected" alert, so Telegram and Discord show the
+picture. It layers only `obico_detection.py` and `obico_actions.py` onto the
+deployed `queue-afc41c79` image; scheduler, frontend and dependencies are
+unchanged. Tested inside the built image without network: 178 Obico and
+notification tests passed; the five new photo checks fail on `queue-afc41c79`.
+
+Verified live on 2026-10-23: `/health` and frontend OK, 36/36 printers
+reconnected, queue unchanged (35 printing, 239 pending), deployed Obico and
+scheduler sources identical to this checkout. A test alert with a photo reached
+Telegram and Discord. Rollback: restore
+`/home/ubuntu/diagnostics/bambuddy-obico-foto-2026-10-23/compose.override.before.yaml`
+(image `mechonix-bambuddy:queue-afc41c79`) and start Compose as below.
+
+## Previous release
+
 Application revision: `afc41c79` on `fix/queue-filament-selection`.
 Image: `mechonix-bambuddy:queue-afc41c79`.
 
