@@ -507,8 +507,10 @@ class NotificationService:
             except Exception:
                 return False, f"HTTP {response.status_code}: {response.text[:200]}"
 
-    async def _send_telegram(self, config: dict, message: str, image_data: bytes | None = None) -> tuple[bool, str]:
-        """Send notification via Telegram bot."""
+    async def _send_telegram(
+        self, config: dict, message: str, image_data: bytes | None = None, reply_markup: dict | None = None
+    ) -> tuple[bool, str]:
+        """Send notification via Telegram bot; reply_markup adds inline buttons."""
         bot_token = config.get("bot_token", "").strip()
         chat_id = config.get("chat_id", "").strip()
 
@@ -545,6 +547,8 @@ class NotificationService:
             form: dict[str, Any] = {"chat_id": chat_id, "caption": message, "parse_mode": "Markdown"}
             if message_thread_id is not None:
                 form["message_thread_id"] = message_thread_id
+            if reply_markup:
+                form["reply_markup"] = json.dumps(reply_markup)
             response = await client.post(
                 url,
                 data=form,
@@ -559,6 +563,8 @@ class NotificationService:
             }
             if message_thread_id is not None:
                 data["message_thread_id"] = message_thread_id
+            if reply_markup:
+                data["reply_markup"] = reply_markup
             response = await client.post(url, json=data)
 
         if response.status_code == 200:
@@ -942,7 +948,15 @@ class NotificationService:
             elif provider.provider_type == "pushover":
                 return await self._send_pushover(config, title, message, image_data=image_data)
             elif provider.provider_type == "telegram":
-                return await self._send_telegram(config, f"*{title}*\n{message}", image_data=image_data)
+                reply_markup = None
+                if event_type == "ai_failure_detection" and (variables or {}).get("printer_id") is not None:
+                    # Pause/stop buttons; presses are handled by telegram_actions.
+                    from backend.app.services.telegram_actions import failure_buttons
+
+                    reply_markup = failure_buttons(variables["printer_id"], variables.get("job_key"))
+                return await self._send_telegram(
+                    config, f"*{title}*\n{message}", image_data=image_data, reply_markup=reply_markup
+                )
             elif provider.provider_type == "email":
                 # finish_photo_url is pulled from the rendered template variables
                 # so _send_email can detect whether the template referenced the
@@ -1488,6 +1502,8 @@ class NotificationService:
         }
 
         title, message = await self._build_message_from_template(db, "ai_failure_detection", variables)
+        # Not template text: the Telegram buttons need the printer and the exact job.
+        variables = dict(variables, printer_id=printer_id, job_key=task_name)
         await self._send_to_providers(
             providers,
             title,

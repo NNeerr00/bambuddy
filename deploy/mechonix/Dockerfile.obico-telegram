@@ -1,0 +1,6 @@
+# Keep the deployed obico-photo runtime; add pause/stop buttons to Telegram AI
+# failure alerts and the service that handles presses.
+FROM mechonix-bambuddy:obico-photo-1a4c4e72
+COPY backend/app/services/telegram_actions.py /app/backend/app/services/telegram_actions.py
+COPY backend/app/services/notification_service.py /app/backend/app/services/notification_service.py
+COPY backend/app/main.py /app/backend/app/main.py
