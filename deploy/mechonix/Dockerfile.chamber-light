@@ -1,0 +1,7 @@
+# Keep the deployed obico-telegram runtime; blink the chamber light while a
+# printer is paused or failed.
+FROM mechonix-bambuddy:obico-telegram-8b0e8ac5
+COPY backend/app/services/chamber_light_signal.py /app/backend/app/services/chamber_light_signal.py
+COPY backend/app/services/bambu_mqtt.py /app/backend/app/services/bambu_mqtt.py
+COPY backend/app/schemas/settings.py /app/backend/app/schemas/settings.py
+COPY backend/app/main.py /app/backend/app/main.py

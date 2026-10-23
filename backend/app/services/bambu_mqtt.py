@@ -7275,11 +7275,12 @@ class BambuMQTTClient:
         )
         return True
 
-    def set_chamber_light(self, on: bool) -> bool:
+    def set_chamber_light(self, on: bool, quiet: bool = False) -> bool:
         """Turn chamber light on or off.
 
         Args:
             on: True to turn on, False to turn off
+            quiet: log at debug level (the blink signal toggles every second)
 
         Returns:
             True if command was sent, False otherwise
@@ -7305,7 +7306,9 @@ class BambuMQTTClient:
                 }
             }
             self._client.publish(self.topic_publish, json.dumps(command), qos=1)
-        logger.info("[%s] Set chamber lights %s (seq=%s)", self.serial_number, "on" if on else "off", self._sequence_id)
+        (logger.debug if quiet else logger.info)(
+            "[%s] Set chamber lights %s (seq=%s)", self.serial_number, "on" if on else "off", self._sequence_id
+        )
         return True
 
     def select_extruder(self, extruder: int) -> bool:

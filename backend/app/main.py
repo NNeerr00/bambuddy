@@ -113,6 +113,7 @@ from backend.app.services.mqtt_smart_plug import mqtt_smart_plug_service
 from backend.app.services.notification_service import notification_service
 from backend.app.services.obico_detection import obico_detection_service
 from backend.app.services.telegram_actions import telegram_action_service
+from backend.app.services.chamber_light_signal import chamber_light_signal_service
 from backend.app.services.print_cost_estimate import plate_scoped_run_estimate as _plate_scoped_run_estimate
 from backend.app.services.print_scheduler import scheduler as print_scheduler
 from backend.app.services.print_storage import (
@@ -9162,6 +9163,7 @@ async def lifespan(app: FastAPI):
     await local_backup_service.start_scheduler()
     await obico_detection_service.start()
     await telegram_action_service.start()
+    await chamber_light_signal_service.start()
 
     # Start the library trash sweeper (#1008)
     await library_trash_service.start_scheduler()
@@ -9241,6 +9243,7 @@ async def lifespan(app: FastAPI):
     archive_purge_service.stop_scheduler()
     obico_detection_service.stop()
     telegram_action_service.stop()
+    chamber_light_signal_service.stop()
     stop_ams_history_recording()
     stop_printer_sensor_history_recording()
     stop_runtime_tracking()

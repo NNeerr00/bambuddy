@@ -580,6 +580,10 @@ class AppSettings(BaseModel):
     )
 
     # Obico AI failure detection (#172)
+    chamber_light_signal_enabled: bool = Field(
+        default=False,
+        description="Blink the chamber light while a printer is paused or failed, so it is found on the shelf",
+    )
     obico_enabled: bool = Field(default=False, description="Enable Obico AI print failure detection")
     obico_ml_url: str = Field(
         default="",
@@ -773,6 +777,7 @@ class AppSettingsUpdate(BaseModel):
     ldap_group_mapping: str | None = None
     ldap_auto_provision: bool | None = None
     ldap_default_group: str | None = None
+    chamber_light_signal_enabled: bool | None = None
     obico_enabled: bool | None = None
     obico_ml_url: str | None = None
     obico_ml_token: str | None = None
