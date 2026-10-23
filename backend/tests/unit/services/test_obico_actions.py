@@ -111,3 +111,34 @@ async def test_notify_swallows_notification_service_exceptions(fake_printer):
             task_name="benchy.3mf",
             score=0.91,
         )
+
+
+@pytest.mark.parametrize("action", ["notify", "pause", "pause_and_off"])
+async def test_alert_carries_the_detection_frame(fake_printer, action):
+    """The frame Obico judged goes out with the alert, whatever the action,
+    so Telegram/Discord show the spaghetti instead of a bare score."""
+    frame = b"\xff\xd8frame\xff\xd9"
+    with (
+        patch("backend.app.services.obico_actions._pause_print"),
+        patch("backend.app.services.obico_actions._turn_off_linked_plugs", new_callable=AsyncMock),
+        patch(
+            "backend.app.services.notification_service.notification_service.on_ai_failure_detection",
+            new_callable=AsyncMock,
+        ) as mock_ai,
+    ):
+        await execute_action(
+            printer_id=fake_printer.id, action=action, task_name="benchy.3mf", score=0.91, image_data=frame
+        )
+
+        assert mock_ai.await_args.kwargs["image_data"] == frame
+
+
+async def test_alert_without_frame_still_goes_out(fake_printer):
+    with patch(
+        "backend.app.services.notification_service.notification_service.on_ai_failure_detection",
+        new_callable=AsyncMock,
+    ) as mock_ai:
+        await execute_action(printer_id=fake_printer.id, action="notify", task_name="benchy.3mf", score=0.91)
+
+        mock_ai.assert_awaited_once()
+        assert mock_ai.await_args.kwargs["image_data"] is None

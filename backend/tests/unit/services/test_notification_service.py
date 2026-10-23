@@ -2170,6 +2170,29 @@ class TestAIFailureDetectionNotifications:
 
             assert captured_variables["task_name"] == "current job"
 
+    @pytest.mark.asyncio
+    async def test_detection_frame_is_attached(self, service, mock_provider, mock_db):
+        frame = b"\xff\xd8frame\xff\xd9"
+        with (
+            patch.object(service, "_get_providers_for_event", new_callable=AsyncMock) as mock_get,
+            patch.object(service, "_send_to_providers", new_callable=AsyncMock) as mock_send,
+            patch.object(service, "_build_message_from_template", new_callable=AsyncMock) as mock_build,
+        ):
+            mock_get.return_value = [mock_provider]
+            mock_build.return_value = ("Possible Print Failure Detected", "details")
+
+            await service.on_ai_failure_detection(
+                printer_id=1,
+                printer_name="X1 Carbon",
+                task_name="benchy.3mf",
+                confidence=0.87,
+                action="notify",
+                db=mock_db,
+                image_data=frame,
+            )
+
+            assert mock_send.call_args.kwargs["image_data"] == frame
+
 
 class TestPlateNotEmptyNotifications:
     """Tests for plate not empty (build plate detection) notifications."""

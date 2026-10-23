@@ -1,0 +1,5 @@
+# Keep the deployed runtime, frontend and scheduler; attach the detection frame to
+# Obico failure alerts. Only the two Obico service modules change.
+FROM mechonix-bambuddy:queue-afc41c79
+COPY backend/app/services/obico_detection.py /app/backend/app/services/obico_detection.py
+COPY backend/app/services/obico_actions.py /app/backend/app/services/obico_actions.py

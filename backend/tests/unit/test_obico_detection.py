@@ -480,6 +480,8 @@ class TestPollOneStateLifecycle:
         ):
             await svc._check_printer(1, status, settings)
             assert mock_action.call_count == 1
+            # The alert carries the very frame the failure was detected on.
+            assert mock_action.call_args.kwargs["image_data"] == FAKE_JPEG
             await svc._check_printer(1, status, settings)
             # Second call must not dispatch again
             assert mock_action.call_count == 1
